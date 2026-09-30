@@ -373,13 +373,13 @@ Generated: do not edit by hand. Regenerate with
 
 ## review
 
-- `teamai review [id]` — Inspect and process .teamai/pending-review.jsonl items
+- `teamai review [id]` — Inspect and process .teamai/pending-review.jsonl items; --dry-run validates apply decisions and previews rejections without writing documents or removing pending items
   - `--apply` — Apply the change for the given id (only for codebase-section)
   - `--reject` — Reject the given id without applying
   - `--reason <msg>` — Reason for reject
   - `--all-apply` — Apply all items at or below --max-risk
   - `--max-risk <level>` — Risk ceiling for --all-apply: high|medium|low (default medium)
-  - `--json` — Machine-readable output
+  - `--json` — Machine-readable output (dry-run decisions include dryRun: true; ok reports validation only)
 
 ## ci
 

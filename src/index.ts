@@ -1218,13 +1218,13 @@ program
 
 program
     .command('review [id]')
-    .description('Inspect and process .teamai/pending-review.jsonl items')
+    .description('Inspect and process .teamai/pending-review.jsonl items; --dry-run validates apply decisions and previews rejections without writing documents or removing pending items')
     .option('--apply', 'Apply the change for the given id (only for codebase-section)')
     .option('--reject', 'Reject the given id without applying')
     .option('--reason <msg>', 'Reason for reject')
     .option('--all-apply', 'Apply all items at or below --max-risk')
     .option('--max-risk <level>', 'Risk ceiling for --all-apply: high|medium|low (default medium)', 'medium')
-    .option('--json', 'Machine-readable output')
+    .option('--json', 'Machine-readable output (dry-run decisions include dryRun: true; ok reports validation only)')
     .action(async (idArg, cmdOpts) => {
         const globalOpts = program.opts() as GlobalOptions;
         const { reviewCmd } = await import('./review-cmd.js');
