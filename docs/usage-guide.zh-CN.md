@@ -1604,6 +1604,8 @@ teamai codebase --lint --output /path/to/repo
 
 不传 `--project` 时，`<project>` 取目录名；在检出的根目录下（主检出或 git 链接 worktree）取仓库名：主检出的真实目录名（经符号链接打开时也是如此），或 bare 仓库的名称（`repo/.bare` 或 `repo.git` → `repo`）。同一仓库的所有检出写入同一个条目。`teamai import --dir` 用同样的方式确定 slug。
 
+`.teamai/pending-review.jsonl` 中的待审改动可用 `teamai review` 查看。用 `teamai review <id> --apply --dry-run`、`teamai review <id> --reject --dry-run` 或 `teamai review --all-apply --max-risk medium --dry-run` 预览处理决定。应用预览会执行与真实应用相同的目标文件和托管章节校验，但不会修改文档或移除待审项；批量预览保留相同的类型与风险筛选。处理预览的 `--json` 输出包含 `dryRun: true`，其中 `ok` 表示通过校验，不表示已写入。去掉 `--dry-run` 才会执行处理。
+
 ### Dashboard
 
 ```bash

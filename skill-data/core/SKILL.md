@@ -113,6 +113,8 @@ teamai recall <q>  # Search what the team has already learned
 teamai env exec -- <cmd>  # Run a CLI with this directory's team env and secrets
 ```
 
+Use `teamai review <id> --apply --dry-run`, `--reject --dry-run`, or `teamai review --all-apply --dry-run` to preview pending-review decisions. Apply previews validate the target and managed section; no document or pending item changes. Decision JSON includes `dryRun: true`, so a successful preview is not a completed write.
+
 Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 

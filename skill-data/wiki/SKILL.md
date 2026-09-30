@@ -302,6 +302,7 @@ _review/                                ← Process files (not part of the knowl
 | Phase | Command / path |
 |------|-------------|
 | Phase 0 structural baseline | `teamai codebase --extract <repo> --project <slug>` (writes `<repo>/teamwiki/`) |
+| Pending codebase review | Inspect with `teamai review`; preview `teamai review <id> --apply --dry-run`, `--reject --dry-run`, or `teamai review --all-apply --dry-run`. Previews validate applicable changes without writing documents or removing pending items. Decision JSON marks previews with `dryRun: true`. |
 | Deep knowledge | Use `teamai codebase --deep-enrich --project <slug> --output <repo>` after extract has written `teamwiki/evidence/code/<slug>/`. `--output` is the repository root, not the `teamwiki/` directory. Prefix with `teamai --dry-run` to preview without writing. TeamAI does not ship a separate team-wiki CLI. No extra plugin is required. |
 | Compile into the wiki after K3 | Skip. TeamAI does not ship a separate team-wiki CLI. Continue with this skill using `teamai` and the files under this skill directory. No extra plugin is required. |
 | Product docs into the graph | Skip. Same English note as above. |

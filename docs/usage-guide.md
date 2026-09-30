@@ -1733,6 +1733,8 @@ teamai codebase --reconcile --output /path/to/repo
 teamai codebase --lint --output /path/to/repo
 ```
 
+Changes queued in `.teamai/pending-review.jsonl` can be inspected with `teamai review`. Preview a decision with `teamai review <id> --apply --dry-run`, `teamai review <id> --reject --dry-run`, or `teamai review --all-apply --max-risk medium --dry-run`. Apply previews validate the target and managed section just like a real apply, but leave both documents and pending items unchanged. Batch previews retain the same kind/risk filtering. Decision previews with `--json` include `dryRun: true`; `ok` means the operation passed validation, not that it was written. Remove `--dry-run` to perform the decision.
+
 When extract finds components, it writes `teamwiki/evidence/code/<project>/_manifest.json` even if AI enrichment is skipped or produces nothing, so `--deep-enrich` can start.
 
 Without `--project`, `<project>` is the directory's name. At the root of a checkout, the main one or a linked git worktree, it is the repo's name: the main checkout's real name (also when opened through a symlink), or a bare repo's (`repo/.bare` or `repo.git` → `repo`). Every checkout of a repo writes the same entry. `teamai import --dir` picks its slug the same way.
