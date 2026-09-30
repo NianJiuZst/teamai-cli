@@ -24,7 +24,11 @@ so the business workspace has **zero residue**, partitioned per project.
 
 ## Cross-team source repository caches
 
-Git source clones live at `~/.teamai/sources/<name>/repos/<sha256(repo.trim())>/repo/`. Their sibling `last-pull.json` records successful clone/pull time for the 24-hour TTL, independent of installation manifests. Failed pulls retain only that repository's cached clone and do not advance its timestamp. `source add`, `browse`, `list`, `pull`, and `remove` all resolve this same repository identity. Removal clears the selected repository cache; name-only legacy clones are neither adopted nor deleted because their source name cannot establish repository ownership.
+Git source clones live at `~/.teamai/sources/<name>/repos/<sha256(repo.trim())>/repo/`. Their sibling `last-pull.json` records successful clone/pull time for the 24-hour TTL, independent of installation manifests. Failed pulls retain only that repository's cached clone and do not advance its timestamp. `source add`, `browse`, `list`, and `pull` all resolve this same repository identity. Removal retains repository caches because other installations may still use them; name-only legacy clones are neither adopted nor deleted because their source name cannot establish repository ownership.
+
+## Cross-team source installation ownership
+
+Installation manifests live separately under `~/.teamai/sources/<name>/installations/<sha256([destinationRoot, teamCheckout])>.json`, using absolute paths from `resolveBaseDir(localConfig)` and `localConfig.repo.localPath`. User HOME and each project/worktree destination have independent records, even when they share a team checkout. Pull reads/writes only that record; stale cleanup and source removal resolve its relative paths against that same destination root. Removal deletes only the current record and preserves the shared clone and all other installations. Push source exclusions and local skill provenance read the same scoped records. Legacy `installed.json` records have no root identity and are never adopted, read for ownership, or removed; a new pull establishes the current installation's record.
 
 ## The two anchors (the core model)
 

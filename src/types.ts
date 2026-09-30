@@ -235,7 +235,7 @@ export function resolveCoAuthor(
 //            ▼             ▼                           ▼
 //  ~/.teamai/sources/<name>/repos/<repo-url-sha256>/repo/ ← git clone
 //  ~/.teamai/sources/<name>/repos/<repo-url-sha256>/last-pull.json ← repo pull TTL
-//  ~/.teamai/sources/<name>/installed.json ← manifest
+//  ~/.teamai/sources/<name>/installations/<installation-id>.json ← per-team, per-destination manifest
 //            │
 //            ▼
 //  ~/.claude/skills/<skill-name>/  ← copy (original name, local team wins on conflict)
@@ -250,7 +250,7 @@ export const SourceConfigSchema = z.object({
 
 export type SourceConfig = z.infer<typeof SourceConfigSchema>;
 
-/** Installed skill manifest for a single source. Persisted to sources/<name>/installed.json. */
+/** Source installation manifest, keyed by team checkout and resource destination. */
 export interface SourceInstallManifest {
   /** ISO timestamp of last successful pull. */
   lastPull: string;

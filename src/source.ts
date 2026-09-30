@@ -48,16 +48,20 @@ function getSourceRepoDir(source: SourceConfig): string {
   return path.join(getSourceRepoCacheDir(source), 'repo');
 }
 
-function getSourceManifestPath(sourceName: string): string {
-  return path.join(getSourceDir(sourceName), 'installed.json');
+export function getSourceManifestPath(sourceName: string, localConfig: LocalConfig): string {
+  const installationId = createHash('sha256').update(JSON.stringify([
+    path.resolve(resolveBaseDir(localConfig)),
+    path.resolve(localConfig.repo.localPath),
+  ])).digest('hex');
+  return path.join(getSourceDir(sourceName), 'installations', `${installationId}.json`);
 }
 
-async function loadSourceManifest(sourceName: string): Promise<SourceInstallManifest | null> {
-  return readJson<SourceInstallManifest>(getSourceManifestPath(sourceName));
+async function loadSourceManifest(sourceName: string, localConfig: LocalConfig): Promise<SourceInstallManifest | null> {
+  return readJson<SourceInstallManifest>(getSourceManifestPath(sourceName, localConfig));
 }
 
-async function saveSourceManifest(sourceName: string, manifest: SourceInstallManifest): Promise<void> {
-  await writeJson(getSourceManifestPath(sourceName), manifest);
+async function saveSourceManifest(sourceName: string, localConfig: LocalConfig, manifest: SourceInstallManifest): Promise<void> {
+  await writeJson(getSourceManifestPath(sourceName, localConfig), manifest);
 }
 
 /**
@@ -200,7 +204,7 @@ export async function sourceAdd(repoUrl: string, options: { name?: string } & Gl
 }
 
 /**
- * Remove a source from teamai.yaml and clean up local cache.
+ * Remove a source from teamai.yaml and clean up this scope's installation.
  */
 export async function sourceRemove(name: string, options: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
@@ -233,13 +237,8 @@ export async function sourceRemove(name: string, options: GlobalOptions): Promis
   // Clean up deployed source skills from tool paths
   await cleanupSourceSkills(name, teamConfig, localConfig);
 
-  // Clean up local source cache
-  const sourceDir = getSourceRepoCacheDir(source);
-  if (await pathExists(sourceDir)) {
-    await remove(sourceDir);
-    log.debug(`Removed local cache for source "${name}"`);
-  }
-  await remove(getSourceManifestPath(name));
+  // Other projects may still use this source's shared clone and manifests.
+  await remove(getSourceManifestPath(name, localConfig));
 
   log.success(`Removed source "${name}"`);
   log.info('Run `teamai push` to share this change with your team.');
@@ -465,7 +464,7 @@ async function pullSingleSource(
   if (skillsToDeploy.length === 0) return;
 
   // Load current manifest to determine what to add/remove
-  const oldManifest = await loadSourceManifest(source.name);
+  const oldManifest = await loadSourceManifest(source.name, localConfig);
   const oldInstalled = new Set(oldManifest?.installedSkills ?? []);
 
   // Collect skills that belong to the local team (they take priority)
@@ -525,7 +524,7 @@ async function pullSingleSource(
 
   // Save manifest
   if (!options.dryRun) {
-    await saveSourceManifest(source.name, {
+    await saveSourceManifest(source.name, localConfig, {
       lastPull: new Date().toISOString(),
       installedSkills: deployed,
       installedPaths,
@@ -676,7 +675,7 @@ async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiCon
  * Clean up all deployed skills from a specific source.
  */
 async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
-  const manifest = await loadSourceManifest(sourceName);
+  const manifest = await loadSourceManifest(sourceName, localConfig);
   if (!manifest) return;
 
   const baseDir = resolveBaseDir(localConfig);
@@ -686,23 +685,27 @@ async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig,
 }
 
 /**
- * Get all installed source skill names (across all sources).
- * Used by scanLocalForPush to exclude source skills from push candidates.
+ * Read source provenance for the current team and resource destination only.
  */
-export async function getAllSourceSkillNames(): Promise<Set<string>> {
-  const names = new Set<string>();
+export async function getSourceSkillOrigins(localConfig: LocalConfig): Promise<Map<string, string>> {
+  const origins = new Map<string, string>();
   const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
-  if (!await pathExists(sourcesDir)) return names;
+  if (!await pathExists(sourcesDir)) return origins;
 
   const sourceDirs = await listDirs(sourcesDir);
   for (const dir of sourceDirs) {
-    const manifest = await loadSourceManifest(dir);
+    const manifest = await loadSourceManifest(dir, localConfig);
     if (manifest) {
       for (const skill of manifest.installedSkills) {
-        names.add(skill);
+        if (!origins.has(skill)) origins.set(skill, dir);
       }
     }
   }
 
-  return names;
+  return origins;
+}
+
+/** Exclude only this scope's installed source skills from push candidates. */
+export async function getAllSourceSkillNames(localConfig: LocalConfig): Promise<Set<string>> {
+  return new Set((await getSourceSkillOrigins(localConfig)).keys());
 }

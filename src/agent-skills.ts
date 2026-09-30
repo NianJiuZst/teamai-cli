@@ -3,7 +3,6 @@ import { listDirs, pathExists, readFileSafe } from './utils/fs.js';
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
 import { isCliOwnedSkillName } from './builtin-skills.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
-import { getUserHome } from './utils/home.js';
 import { parseFrontmatter } from './utils/frontmatter.js';
 
 // ─── Local agent skill scanning ─────────────────────────
@@ -51,25 +50,10 @@ export interface ClassifyContext {
 export async function buildClassifyContext(localConfig: LocalConfig): Promise<ClassifyContext> {
   const teamSkills = await collectTeamRepoSkills(localConfig.repo.localPath);
 
-  const sourceSkills = new Map<string, string>();
+  let sourceSkills = new Map<string, string>();
   try {
-    const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
-    if (await pathExists(sourcesDir)) {
-      const sourceNames = await listDirs(sourcesDir);
-      for (const sourceName of sourceNames) {
-        const manifestPath = path.join(sourcesDir, sourceName, 'installed.json');
-        const raw = await readFileSafe(manifestPath);
-        if (!raw) continue;
-        try {
-          const manifest = JSON.parse(raw) as { installedSkills?: string[] };
-          for (const skill of manifest.installedSkills ?? []) {
-            if (!sourceSkills.has(skill)) sourceSkills.set(skill, sourceName);
-          }
-        } catch {
-          // ignore malformed manifest
-        }
-      }
-    }
+    const { getSourceSkillOrigins } = await import('./source.js');
+    sourceSkills = await getSourceSkillOrigins(localConfig);
   } catch {
     // ignore — running outside a normal HOME env
   }

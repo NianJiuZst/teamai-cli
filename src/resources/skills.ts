@@ -561,7 +561,7 @@ export class SkillsHandler extends ResourceHandler {
     let sourceSkillNames: Set<string>;
     try {
       const { getAllSourceSkillNames } = await import('../source.js');
-      sourceSkillNames = await getAllSourceSkillNames();
+      sourceSkillNames = await getAllSourceSkillNames(localConfig);
     } catch {
       sourceSkillNames = new Set();
     }

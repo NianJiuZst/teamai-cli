@@ -28,7 +28,7 @@ vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
 }));
 
-import { deriveSourceName, getAllSourceSkillNames, pullSources, sourceSyncWarnings } from '../source.js';
+import { deriveSourceName, getSourceManifestPath, getAllSourceSkillNames, pullSources, sourceSyncWarnings } from '../source.js';
 import type { TeamaiConfig, LocalConfig, SourceInstallManifest } from '../types.js';
 
 describe('source', () => {
@@ -84,8 +84,29 @@ describe('source', () => {
   });
 
   describe('getAllSourceSkillNames', () => {
+    it('ignores unscoped legacy manifests whose deployment root cannot be proven', async () => {
+      await fse.outputJson(path.join(sourcesDir, 'legacy', 'installed.json'), {
+        lastPull: new Date().toISOString(), installedSkills: ['local-draft'],
+      });
+      expect(await getAllSourceSkillNames(localConfig)).toEqual(new Set());
+    });
+
+    it('isolates manifests by destination and team checkout, including user scope and worktrees', async () => {
+      const projectConfig: LocalConfig = { ...localConfig, scope: 'project', projectRoot: path.join(tmpDir, 'project') };
+      const worktreeConfig: LocalConfig = { ...projectConfig, projectRoot: path.join(tmpDir, 'worktree') };
+      const otherTeamConfig: LocalConfig = { ...projectConfig, repo: { ...localConfig.repo, localPath: path.join(tmpDir, 'other-team') } };
+      for (const [index, config] of [localConfig, projectConfig, worktreeConfig, otherTeamConfig].entries()) {
+        await fse.outputJson(getSourceManifestPath('shared', config), {
+          lastPull: new Date().toISOString(), installedSkills: [`skill-${index}`],
+        });
+      }
+      for (const [index, config] of [localConfig, projectConfig, worktreeConfig, otherTeamConfig].entries()) {
+        expect(await getAllSourceSkillNames(config)).toEqual(new Set([`skill-${index}`]));
+      }
+    });
+
     it('should return empty set when no sources exist', async () => {
-      const names = await getAllSourceSkillNames();
+      const names = await getAllSourceSkillNames(localConfig);
       expect(names.size).toBe(0);
     });
 
@@ -97,9 +118,9 @@ describe('source', () => {
         lastPull: new Date().toISOString(),
         installedSkills: ['skill-a', 'skill-b'],
       };
-      await fse.writeJson(path.join(manifestDir, 'installed.json'), manifest);
+      await fse.outputJson(getSourceManifestPath(path.basename(manifestDir), localConfig), manifest);
 
-      const names = await getAllSourceSkillNames();
+      const names = await getAllSourceSkillNames(localConfig);
       expect(names.has('skill-a')).toBe(true);
       expect(names.has('skill-b')).toBe(true);
       expect(names.size).toBe(2);
@@ -113,10 +134,10 @@ describe('source', () => {
           lastPull: new Date().toISOString(),
           installedSkills: [`${source}-skill`],
         };
-        await fse.writeJson(path.join(manifestDir, 'installed.json'), manifest);
+        await fse.outputJson(getSourceManifestPath(path.basename(manifestDir), localConfig), manifest);
       }
 
-      const names = await getAllSourceSkillNames();
+      const names = await getAllSourceSkillNames(localConfig);
       expect(names.has('team-a-skill')).toBe(true);
       expect(names.has('team-b-skill')).toBe(true);
       expect(names.size).toBe(2);
@@ -129,12 +150,12 @@ describe('source', () => {
 
       const manifestDir = path.join(sourcesDir, 'windows-team');
       await fse.ensureDir(manifestDir);
-      await fse.writeJson(path.join(manifestDir, 'installed.json'), {
+      await fse.outputJson(getSourceManifestPath(path.basename(manifestDir), localConfig), {
         lastPull: new Date().toISOString(),
         installedSkills: ['windows-skill'],
       } satisfies SourceInstallManifest);
 
-      const names = await getAllSourceSkillNames();
+      const names = await getAllSourceSkillNames(localConfig);
       expect(names).toContain('windows-skill');
     });
   });
@@ -228,7 +249,7 @@ describe('source', () => {
 
       // Manifest should be written
       const manifest = await fse.readJson(
-        path.join(sourcesDir, 'platform', 'installed.json'),
+        getSourceManifestPath('platform', localConfig),
       ) as SourceInstallManifest;
       expect(manifest.installedSkills).toContain('cool-skill');
     });
@@ -305,7 +326,7 @@ describe('source', () => {
       await pullSources(localConfig, {});
 
       // Source skill should NOT be in the manifest (local takes priority)
-      const manifestPath = path.join(sourcesDir, 'platform', 'installed.json');
+      const manifestPath = getSourceManifestPath('platform', localConfig);
       if (await fse.pathExists(manifestPath)) {
         const manifest = await fse.readJson(manifestPath) as SourceInstallManifest;
         expect(manifest.installedSkills).not.toContain('shared-name');
@@ -327,7 +348,7 @@ describe('source', () => {
         installedSkills: ['old-skill'],
       };
       await fse.ensureDir(path.join(sourcesDir, 'platform'));
-      await fse.writeJson(path.join(sourcesDir, 'platform', 'installed.json'), oldManifest);
+      await fse.outputJson(getSourceManifestPath('platform', localConfig), oldManifest);
 
       // Deploy old-skill to claude dir
       await fse.ensureDir(path.join(homeDir, '.claude', 'skills', 'old-skill'));
@@ -408,7 +429,7 @@ describe('source', () => {
 
       const sourceDir = path.join(sourcesDir, 'platform');
       await fse.ensureDir(sourceDir);
-      await fse.writeJson(path.join(sourceDir, 'installed.json'), {
+      await fse.outputJson(getSourceManifestPath('platform', localConfig), {
         lastPull: new Date(0).toISOString(),
         installedSkills: ['old-skill'],
         installedPaths: { 'old-skill': ['.codex/skills/old-skill'] },
@@ -425,7 +446,7 @@ describe('source', () => {
 
       await pullSources(localConfig, { force: true });
 
-      const updatedManifest = await fse.readJson(path.join(sourceDir, 'installed.json')) as SourceInstallManifest;
+      const updatedManifest = await fse.readJson(getSourceManifestPath('platform', localConfig)) as SourceInstallManifest;
       expect(updatedManifest.installedPaths?.['old-skill']).toEqual([
         '.codex/skills/old-skill', '.agents/skills/old-skill',
       ]);

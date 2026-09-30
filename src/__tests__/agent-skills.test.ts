@@ -1,3 +1,4 @@
+import { getSourceManifestPath } from '../source.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
@@ -164,7 +165,7 @@ describe('classifySkill', () => {
   it('returns [source:<name>] when skill is in a source manifest', async () => {
     const sourcesDir = path.join(fx.homeDir, '.teamai', 'sources', 'partner');
     await fse.ensureDir(sourcesDir);
-    await fse.writeJson(path.join(sourcesDir, 'installed.json'), {
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
       lastPull: '2026-01-01T00:00:00Z',
       installedSkills: ['external-skill'],
     });
@@ -172,6 +173,19 @@ describe('classifySkill', () => {
     const cls = classifySkill('external-skill', ctx);
     expect(cls).toEqual({ kind: 'source', name: 'partner' });
     expect(formatSkillSource(cls)).toBe('[source:partner]');
+  });
+
+  it('keeps a local skill local when only another project or a legacy manifest lists it', async () => {
+    const otherConfig: LocalConfig = { ...fx.localConfig, scope: 'project', projectRoot: path.join(fx.tmpDir, 'other-project') };
+    await fse.outputJson(getSourceManifestPath('partner', otherConfig), {
+      lastPull: '2026-01-01T00:00:00Z', installedSkills: ['foreign-skill'],
+    });
+    await fse.outputJson(path.join(fx.homeDir, '.teamai', 'sources', 'legacy', 'installed.json'), {
+      lastPull: '2026-01-01T00:00:00Z', installedSkills: ['legacy-skill'],
+    });
+    const ctx = await buildClassifyContext(fx.localConfig);
+    expect(classifySkill('foreign-skill', ctx)).toEqual({ kind: 'local-only' });
+    expect(classifySkill('legacy-skill', ctx)).toEqual({ kind: 'local-only' });
   });
 
   it('returns [builtin] for the names a pre-stub release deployed, until pull prunes them', async () => {
@@ -295,7 +309,7 @@ describe('scanInstalledAgents', () => {
     // source
     const sourceDir = path.join(fx.homeDir, '.teamai', 'sources', 'partner');
     await fse.ensureDir(sourceDir);
-    await fse.writeJson(path.join(sourceDir, 'installed.json'), {
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
       lastPull: '2026-01-01T00:00:00Z',
       installedSkills: ['external'],
     });

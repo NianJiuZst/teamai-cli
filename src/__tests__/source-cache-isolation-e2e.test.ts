@@ -74,7 +74,7 @@ it('keeps same-named source repos separate across teams, including removal and c
     const caches = path.join(home, '.teamai', 'sources', 'shared', 'repos');
     expect(fs.readdirSync(caches)).toHaveLength(2);
     run(['source', 'remove', 'shared'], projects[0]);
-    expect(fs.readdirSync(caches)).toHaveLength(1);
+    expect(fs.readdirSync(caches)).toHaveLength(2);
     expect(fs.existsSync(legacyRepo)).toBe(true);
     fs.renameSync(sourceRemotes[1], `${sourceRemotes[1]}.offline`);
     expect(run(['pull', '--force'], projects[1])).toContain('[source:shared] Pull failed:');

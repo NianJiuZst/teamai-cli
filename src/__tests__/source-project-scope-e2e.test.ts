@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -61,7 +62,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
     }
 
-    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-project-e2e-'));
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-project-e2e-')));
     try {
       const home = path.join(sandbox, 'home');
       const projectRoot = path.join(sandbox, 'project');
@@ -181,7 +182,8 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
         ),
       ).toContain('# External beta skill');
 
-      const manifestPath = path.join(home, '.teamai', 'sources', 'beta-source', 'installed.json');
+      const installationId = createHash('sha256').update(JSON.stringify([projectRoot, teamRepo])).digest('hex');
+      const manifestPath = path.join(home, '.teamai', 'sources', 'beta-source', 'installations', `${installationId}.json`);
       expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).installedSkills)
         .toEqual(['external-beta-skill']);
 
@@ -195,7 +197,8 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(removeResult.output).toContain('Removed source "beta-source"');
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
       expect(fs.existsSync(manifestPath)).toBe(false);
-      expect(fs.readdirSync(path.join(path.dirname(manifestPath), 'repos'))).toEqual([]);
+      const repoId = createHash('sha256').update(sourceUrl).digest('hex');
+      expect(fs.existsSync(path.join(home, '.teamai', 'sources', 'beta-source', 'repos', repoId, 'repo'))).toBe(true);
       expect(
         fs.existsSync(path.join(projectRoot, '.claude', 'skills', 'external-beta-skill')),
       ).toBe(false);
