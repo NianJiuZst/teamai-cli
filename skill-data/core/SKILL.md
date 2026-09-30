@@ -113,6 +113,8 @@ teamai recall <q>  # Search what the team has already learned
 teamai env exec -- <cmd>  # Run a CLI with this directory's team env and secrets
 ```
 
+Git subscription caches are keyed by source name and repository URL, so different teams may reuse a source name. Changing the URL clones the newly configured repository; a failed pull uses only that repository's cache. `source remove` clears only the selected repository cache.
+
 Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 

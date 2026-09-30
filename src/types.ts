@@ -233,7 +233,8 @@ export function resolveCoAuthor(
 //            │    teamai source browse <name>          │  teamai pull
 //            │             │                           │
 //            ▼             ▼                           ▼
-//  ~/.teamai/sources/<name>/repo/  ← git clone
+//  ~/.teamai/sources/<name>/repos/<repo-url-sha256>/repo/ ← git clone
+//  ~/.teamai/sources/<name>/repos/<repo-url-sha256>/last-pull.json ← repo pull TTL
 //  ~/.teamai/sources/<name>/installed.json ← manifest
 //            │
 //            ▼

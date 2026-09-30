@@ -194,7 +194,8 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(removeResult.code, removeResult.output).toBe(0);
       expect(removeResult.output).toContain('Removed source "beta-source"');
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
-      expect(fs.existsSync(path.dirname(manifestPath))).toBe(false);
+      expect(fs.existsSync(manifestPath)).toBe(false);
+      expect(fs.readdirSync(path.join(path.dirname(manifestPath), 'repos'))).toEqual([]);
       expect(
         fs.existsSync(path.join(projectRoot, '.claude', 'skills', 'external-beta-skill')),
       ).toBe(false);

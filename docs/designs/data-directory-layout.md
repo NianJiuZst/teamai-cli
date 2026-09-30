@@ -22,6 +22,10 @@ downloaded skill resources (4.1 MB), a search index (1.8 MB), plus config, state
 The end goal (P1+) is to move machine-local data to `~/.teamai/projects/<slug>/`
 so the business workspace has **zero residue**, partitioned per project.
 
+## Cross-team source repository caches
+
+Git source clones live at `~/.teamai/sources/<name>/repos/<sha256(repo.trim())>/repo/`. Their sibling `last-pull.json` records successful clone/pull time for the 24-hour TTL, independent of installation manifests. Failed pulls retain only that repository's cached clone and do not advance its timestamp. `source add`, `browse`, `list`, `pull`, and `remove` all resolve this same repository identity. Removal clears the selected repository cache; name-only legacy clones are neither adopted nor deleted because their source name cannot establish repository ownership.
+
 ## The two anchors (the core model)
 
 A git worktree has two distinct "roots", and teamai needs both:

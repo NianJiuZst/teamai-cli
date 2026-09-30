@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { loadTeamConfig, autoDetectInit, loadLocalConfig, detectProjectConfig } from './config.js';
@@ -38,8 +39,13 @@ function getSourceDir(sourceName: string): string {
   return path.join(getUserHome(), '.teamai', 'sources', sourceName);
 }
 
-function getSourceRepoDir(sourceName: string): string {
-  return path.join(getSourceDir(sourceName), 'repo');
+function getSourceRepoCacheDir(source: SourceConfig): string {
+  const repoId = createHash('sha256').update(source.repo.trim()).digest('hex');
+  return path.join(getSourceDir(source.name), 'repos', repoId);
+}
+
+function getSourceRepoDir(source: SourceConfig): string {
+  return path.join(getSourceRepoCacheDir(source), 'repo');
 }
 
 function getSourceManifestPath(sourceName: string): string {
@@ -58,28 +64,35 @@ async function saveSourceManifest(sourceName: string, manifest: SourceInstallMan
  * Check if a source repo needs pulling based on TTL.
  * Returns true if the last pull was more than SOURCE_PULL_TTL_MS ago.
  */
-async function shouldPullSource(sourceName: string): Promise<boolean> {
-  const manifest = await loadSourceManifest(sourceName);
-  if (!manifest) return true;
-  const elapsed = Date.now() - new Date(manifest.lastPull).getTime();
-  return elapsed > SOURCE_PULL_TTL_MS;
+async function shouldPullSource(source: SourceConfig): Promise<boolean> {
+  const stamp = await readJson<{ lastPull: string }>(path.join(getSourceRepoCacheDir(source), 'last-pull.json'));
+  if (!stamp) return true;
+  const elapsed = Date.now() - new Date(stamp.lastPull).getTime();
+  return !Number.isFinite(elapsed) || elapsed > SOURCE_PULL_TTL_MS;
+}
+
+async function recordSourcePull(source: SourceConfig): Promise<void> {
+  await writeJson(path.join(getSourceRepoCacheDir(source), 'last-pull.json'), {
+    lastPull: new Date().toISOString(),
+  });
 }
 
 /**
  * Clone or pull a source repo. Returns the repo path, or null on failure.
  */
 async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<string | null> {
-  const repoDir = getSourceRepoDir(source.name);
+  const repoDir = getSourceRepoDir(source);
 
   if (await pathExists(repoDir)) {
     // Existing clone: pull if TTL expired or forced
-    if (!force && !(await shouldPullSource(source.name))) {
+    if (!force && !(await shouldPullSource(source))) {
       log.debug(`[source:${source.name}] Within pull TTL, skipping git pull`);
       return repoDir;
     }
 
     try {
       const result = await pullRepo(repoDir);
+      await recordSourcePull(source);
       log.debug(`[source:${source.name}] Git pull: ${result}`);
       return repoDir;
     } catch (e) {
@@ -102,6 +115,7 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<s
       ? repoInfo.httpsUrl
       : `${repoInfo.owner}/${repoInfo.repo}`;
     provider.cloneRepo(cloneTarget, repoDir);
+    await recordSourcePull(source);
 
     cloneSpin.succeed(`[source:${source.name}] Cloned`);
     return repoDir;
@@ -193,7 +207,8 @@ export async function sourceRemove(name: string, options: GlobalOptions): Promis
   const repoPath = localConfig.repo.localPath;
 
   const existing = teamConfig.sources ?? [];
-  if (!existing.some((s) => s.name === name)) {
+  const source = existing.find((s) => s.name === name);
+  if (!source) {
     log.error(`Source "${name}" not found. Run \`teamai source list\` to see configured sources.`);
     return;
   }
@@ -219,11 +234,12 @@ export async function sourceRemove(name: string, options: GlobalOptions): Promis
   await cleanupSourceSkills(name, teamConfig, localConfig);
 
   // Clean up local source cache
-  const sourceDir = getSourceDir(name);
+  const sourceDir = getSourceRepoCacheDir(source);
   if (await pathExists(sourceDir)) {
     await remove(sourceDir);
     log.debug(`Removed local cache for source "${name}"`);
   }
+  await remove(getSourceManifestPath(name));
 
   log.success(`Removed source "${name}"`);
   log.info('Run `teamai push` to share this change with your team.');
@@ -256,7 +272,7 @@ export async function sourceList(): Promise<void> {
   if (gitSources.length > 0) {
     log.info(`Git cross-team sources (${gitSources.length}):`);
     for (const source of gitSources) {
-      const repoDir = getSourceRepoDir(source.name);
+      const repoDir = getSourceRepoDir(source);
       const cloned = await pathExists(repoDir);
       const status = cloned ? '(synced)' : '(not yet synced)';
       log.info(`  ${source.name} ${status}`);

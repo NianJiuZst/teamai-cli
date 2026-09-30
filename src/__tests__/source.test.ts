@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import fse from 'fs-extra';
 
@@ -138,7 +139,29 @@ describe('source', () => {
     });
   });
 
+  function fixtureSourceRepoDir(): string {
+    const source = teamConfig.sources![0];
+    return path.join(sourcesDir, source.name, 'repos', createHash('sha256').update(source.repo.trim()).digest('hex'), 'repo');
+  }
+
   describe('pullSources', () => {
+    it('uses a separate pull TTL for each repository even without a skill installation', async () => {
+      const YAML = (await import('yaml')).default;
+      const { pullRepo } = await import('../utils/git.js');
+      vi.mocked(pullRepo).mockClear();
+      for (const repo of ['https://source.test/alpha/repo.git', 'https://source.test/beta/repo.git']) {
+        teamConfig.sources = [{ name: 'shared', repo }];
+        await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+        const repoDir = fixtureSourceRepoDir();
+        await fse.ensureDir(repoDir);
+        await fse.writeFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo }));
+        await pullSources(localConfig, {});
+        await pullSources(localConfig, {});
+      }
+      expect(pullRepo).toHaveBeenCalledTimes(2);
+      expect(await fse.pathExists(path.join(sourcesDir, 'shared', 'installed.json'))).toBe(false);
+    });
+
     it('should do nothing when no sources configured', async () => {
       await pullSources(localConfig, {});
       // No errors, no side effects
@@ -156,7 +179,7 @@ describe('source', () => {
       );
 
       // Create source repo with no publicSkills
-      const sourceRepoDir = path.join(sourcesDir, 'other', 'repo');
+      const sourceRepoDir = fixtureSourceRepoDir();
       await fse.ensureDir(path.join(sourceRepoDir, 'skills'));
       await fse.writeFile(
         path.join(sourceRepoDir, 'teamai.yaml'),
@@ -180,7 +203,7 @@ describe('source', () => {
       );
 
       // Create source repo with publicSkills
-      const sourceRepoDir = path.join(sourcesDir, 'platform', 'repo');
+      const sourceRepoDir = fixtureSourceRepoDir();
       await fse.ensureDir(path.join(sourceRepoDir, 'skills', 'cool-skill'));
       await fse.writeFile(
         path.join(sourceRepoDir, 'skills', 'cool-skill', 'SKILL.md'),
@@ -219,7 +242,7 @@ describe('source', () => {
 
       const YAML = (await import('yaml')).default;
       await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
-      const sourceRepoDir = path.join(sourcesDir, 'platform', 'repo');
+      const sourceRepoDir = fixtureSourceRepoDir();
       await fse.ensureDir(path.join(sourceRepoDir, 'skills', 'cool-skill'));
       await fse.writeFile(
         path.join(sourceRepoDir, 'skills', 'cool-skill', 'SKILL.md'),
@@ -264,7 +287,7 @@ describe('source', () => {
       );
 
       // Create source repo with same skill name
-      const sourceRepoDir = path.join(sourcesDir, 'platform', 'repo');
+      const sourceRepoDir = fixtureSourceRepoDir();
       await fse.ensureDir(path.join(sourceRepoDir, 'skills', 'shared-name'));
       await fse.writeFile(
         path.join(sourceRepoDir, 'skills', 'shared-name', 'SKILL.md'),
@@ -314,7 +337,7 @@ describe('source', () => {
       );
 
       // Source repo now only has new-skill (old-skill removed from publicSkills)
-      const sourceRepoDir = path.join(sourcesDir, 'platform', 'repo');
+      const sourceRepoDir = fixtureSourceRepoDir();
       await fse.ensureDir(path.join(sourceRepoDir, 'skills', 'new-skill'));
       await fse.writeFile(
         path.join(sourceRepoDir, 'skills', 'new-skill', 'SKILL.md'),
@@ -353,7 +376,7 @@ describe('source', () => {
         YAML.stringify(teamConfig),
       );
 
-      const sourceRepoDir = path.join(sourcesDir, 'platform', 'repo');
+      const sourceRepoDir = fixtureSourceRepoDir();
       await fse.ensureDir(path.join(sourceRepoDir, 'skills', 'cool-skill'));
       await fse.writeFile(
         path.join(sourceRepoDir, 'skills', 'cool-skill', 'SKILL.md'),
@@ -394,9 +417,9 @@ describe('source', () => {
       await fse.writeFile(path.join(homeDir, '.codex', 'skills', 'old-skill', 'SKILL.md'), '# Source copy');
       await fse.ensureDir(path.join(homeDir, '.agents', 'skills', 'old-skill'));
       await fse.writeFile(path.join(homeDir, '.agents', 'skills', 'old-skill', 'SKILL.md'), '# User copy');
-      await fse.ensureDir(path.join(sourceDir, 'repo', 'skills', 'old-skill'));
-      await fse.writeFile(path.join(sourceDir, 'repo', 'skills', 'old-skill', 'SKILL.md'), '# Updated source');
-      await fse.writeFile(path.join(sourceDir, 'repo', 'teamai.yaml'), YAML.stringify({
+      await fse.ensureDir(path.join(fixtureSourceRepoDir(), 'skills', 'old-skill'));
+      await fse.writeFile(path.join(fixtureSourceRepoDir(), 'skills', 'old-skill', 'SKILL.md'), '# Updated source');
+      await fse.writeFile(path.join(fixtureSourceRepoDir(), 'teamai.yaml'), YAML.stringify({
         team: 'platform', repo: 'git@git.woa.com:platform/repo.git', publicSkills: ['old-skill'],
       }));
 
@@ -407,9 +430,9 @@ describe('source', () => {
         '.codex/skills/old-skill', '.agents/skills/old-skill',
       ]);
 
-      await fse.ensureDir(path.join(sourceDir, 'repo', 'skills', 'new-skill'));
-      await fse.writeFile(path.join(sourceDir, 'repo', 'skills', 'new-skill', 'SKILL.md'), '# New');
-      await fse.writeFile(path.join(sourceDir, 'repo', 'teamai.yaml'), YAML.stringify({
+      await fse.ensureDir(path.join(fixtureSourceRepoDir(), 'skills', 'new-skill'));
+      await fse.writeFile(path.join(fixtureSourceRepoDir(), 'skills', 'new-skill', 'SKILL.md'), '# New');
+      await fse.writeFile(path.join(fixtureSourceRepoDir(), 'teamai.yaml'), YAML.stringify({
         team: 'platform', repo: 'git@git.woa.com:platform/repo.git', publicSkills: ['new-skill'],
       }));
 

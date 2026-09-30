@@ -2447,6 +2447,8 @@ teamai source remove other-team
 
 A subscription source's skills are automatically synced locally on `teamai pull`, coexisting with the team's own skills. `teamai source add`/`remove` updates the active scope's team repo immediately, so local `list`, `browse`, and `pull` commands use the change before it is committed. The subscription itself is stored in the `sources` field of that repo's `teamai.yaml`. Run `teamai push` to open a PR with the config change; once it merges, every teammate's `teamai pull` picks up the new source automatically.
 
+Source clones and their pull timestamps are cached by source name and a SHA-256 hash of the configured repository URL. Teams can use the same source name for different repositories without sharing a clone or its 24-hour pull TTL. Changing the URL uses a fresh cache; legacy name-only clones are left untouched and are not reused. Removing a source clears only its repository cache.
+
 A source only shares the skills it opts in via a `publicSkills` list in its own `teamai.yaml`. If the repo has no `teamai.yaml`, or declares no `publicSkills`, `teamai source add` succeeds but warns that the source will sync **0 skills** — the source team has to publish a `publicSkills` list before anything flows through.
 
 #### HTTP Source
