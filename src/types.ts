@@ -254,6 +254,8 @@ export type SourceConfig = z.infer<typeof SourceConfigSchema>;
 export interface SourceInstallManifest {
   /** Absolute destination root, allowing other installations to protect shared paths. */
   destinationRoot?: string;
+  /** Hash of the configured repository URL, used to reject conflicting writers. */
+  repositoryId?: string;
   /** ISO timestamp of last successful pull. */
   lastPull: string;
   /** Skill names currently deployed from this source. */

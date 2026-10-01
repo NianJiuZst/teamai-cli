@@ -61,7 +61,7 @@ export function assertWithinRoot(root: string, candidate: string, message?: stri
  * @param p  Input path (may be relative, may contain ~).
  * @returns  Resolved absolute path string.
  */
-function resolveReal(p: string): string {
+export function resolveReal(p: string): string {
   const expanded = p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
   const abs = path.resolve(expanded);
   try {

@@ -18,6 +18,7 @@ it.each([
   { cleanup: 'remove', sameAlias: false },
   { cleanup: 'stale', sameAlias: true },
   { cleanup: 'stale', sameAlias: false },
+  { cleanup: 'conflict', sameAlias: false },
 ])('preserves a shared user-scope destination until its last owner leaves ($cleanup, same alias: $sameAlias)', ({ cleanup, sameAlias }) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-shared-destination-')));
   const home = path.join(root, 'home');
@@ -54,6 +55,22 @@ it.each([
     git(['clone', '-q', '--bare', sourceSeed, sourceRemote], root);
     git(['config', '--file', path.join(home, '.gitconfig'), `url.file://${sourceRemote}.insteadOf`, sourceUrl], root);
 
+    const betaSourceUrl = 'https://source.test/beta/skills.git';
+    if (cleanup === 'conflict') {
+      const betaSourceSeed = path.join(root, 'beta-source-seed');
+      const betaSourceRemote = path.join(root, 'beta-source.git');
+      fs.mkdirSync(path.join(betaSourceSeed, 'skills', 'old-skill'), { recursive: true });
+      fs.writeFileSync(path.join(betaSourceSeed, 'skills', 'old-skill', 'SKILL.md'), '# Beta source old-skill\n');
+      fs.writeFileSync(path.join(betaSourceSeed, 'teamai.yaml'), YAML.stringify({
+        team: 'beta-source', repo: betaSourceUrl, publicSkills: ['old-skill'],
+      }));
+      git(['init', '-q', '-b', 'main'], betaSourceSeed);
+      git(['add', '-A'], betaSourceSeed);
+      git(['-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'seed conflicting source'], betaSourceSeed);
+      git(['clone', '-q', '--bare', betaSourceSeed, betaSourceRemote], root);
+      git(['config', '--file', path.join(home, '.gitconfig'), `url.file://${betaSourceRemote}.insteadOf`, betaSourceUrl], root);
+    }
+
     const teams = ['alpha', 'beta'].map((name) => {
       const alias = sameAlias ? 'shared' : `${name}-source`;
       const teamRepo = path.join(root, `${name}-team-repo`);
@@ -61,7 +78,7 @@ it.each([
       fs.mkdirSync(teamRepo);
       fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), YAML.stringify({
         team: name, repo: teamRemote, provider: 'git', reviewers: [],
-        sources: [{ name: alias, repo: sourceUrl }],
+        sources: [{ name: alias, repo: cleanup === 'conflict' && name === 'beta' ? betaSourceUrl : sourceUrl }],
         toolPaths: { claude: { skills: '.claude/skills' } },
       }));
       git(['init', '-q', '-b', 'main'], teamRepo);
@@ -76,17 +93,54 @@ it.each([
       };
       const installationId = createHash('sha256').update(JSON.stringify([home, teamRepo])).digest('hex');
       const manifest = path.join(home, '.teamai', 'sources', alias, 'installations', `${installationId}.json`);
-      fs.writeFileSync(path.join(home, '.teamai', 'config.yaml'), YAML.stringify(config));
-      run(['pull', '--force']);
-      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source old-skill\n');
-      expect(JSON.parse(fs.readFileSync(manifest, 'utf8')).installedSkills).toEqual(['old-skill']);
       return { alias, config, manifest };
     });
     const [alpha, beta] = teams;
     expect(alpha.manifest).not.toBe(beta.manifest);
+    for (const team of teams) {
+      fs.writeFileSync(path.join(home, '.teamai', 'config.yaml'), YAML.stringify(team.config));
+      if (cleanup === 'conflict' && team === beta) {
+        const alphaManifest = fs.readFileSync(alpha.manifest, 'utf8');
+        const warning = `[source:${beta.alias}] Skipping "old-skill": another source repository owns `;
+        expect(fs.existsSync(beta.manifest)).toBe(false);
+        const preview = run(['pull', '--force', '--dry-run']);
+        expect(preview).toContain(warning);
+        expect(preview).not.toContain('Would pull old-skill (new)');
+        expect(fs.existsSync(beta.manifest)).toBe(false);
+        expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
+        expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source old-skill\n');
+
+        const output = run(['pull', '--force']);
+        expect(output).toContain(warning);
+        const betaManifest = JSON.parse(fs.readFileSync(beta.manifest, 'utf8'));
+        expect(betaManifest.installedSkills).toEqual([]);
+        expect(betaManifest.installedPaths).not.toHaveProperty('old-skill');
+        expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
+      } else {
+        run(['pull', '--force']);
+        expect(JSON.parse(fs.readFileSync(team.manifest, 'utf8')).installedSkills).toEqual(['old-skill']);
+      }
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source old-skill\n');
+    }
     const betaManifest = fs.readFileSync(beta.manifest, 'utf8');
     fs.mkdirSync(path.dirname(skill('local-draft')), { recursive: true });
     fs.writeFileSync(skill('local-draft'), '# Unrelated local draft\n');
+
+    if (cleanup === 'conflict') {
+      const alphaManifest = fs.readFileSync(alpha.manifest, 'utf8');
+      expect(run(['source', 'remove', beta.alias])).toContain(`Removed source "${beta.alias}"`);
+      expect(fs.existsSync(beta.manifest)).toBe(false);
+      expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source old-skill\n');
+      expect(fs.readFileSync(skill('local-draft'), 'utf8')).toBe('# Unrelated local draft\n');
+      fs.writeFileSync(path.join(home, '.teamai', 'config.yaml'), YAML.stringify(alpha.config));
+      expect(run(['source', 'remove', alpha.alias])).toContain(`Removed source "${alpha.alias}"`);
+      expect(fs.existsSync(alpha.manifest)).toBe(false);
+      expect(fs.existsSync(path.dirname(skill('old-skill')))).toBe(false);
+      expect(fs.readFileSync(skill('local-draft'), 'utf8')).toBe('# Unrelated local draft\n');
+      return;
+    }
+
     fs.writeFileSync(path.join(home, '.teamai', 'config.yaml'), YAML.stringify(alpha.config));
 
     if (cleanup === 'stale') {
