@@ -175,6 +175,49 @@ describe('classifySkill', () => {
     expect(formatSkillSource(cls)).toBe('[source:partner]');
   });
 
+  it('uses recorded physical paths without aliasing nested names to their basename', async () => {
+    const sourcePath = path.join(fx.homeDir, '.claude', 'skills', 'group', 'child');
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
+      lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+      installedSkills: ['group/child'],
+      installedPaths: { 'group/child': ['.claude/skills/group/child'] },
+    });
+    const ctx = await buildClassifyContext(fx.localConfig);
+    expect(classifySkill('group/child', ctx, sourcePath)).toEqual({ kind: 'source', name: 'partner' });
+    expect(classifySkill('child', ctx, path.join(fx.homeDir, '.claude', 'skills', 'child'))).toEqual({ kind: 'local-only' });
+    expect(classifySkill('group/child', ctx, path.join(fx.homeDir, '.cursor', 'skills', 'group', 'child'))).toEqual({ kind: 'local-only' });
+    expect(classifySkill('child', ctx)).toEqual({ kind: 'local-only' });
+  });
+
+  it('keeps team and builtin precedence when source path records overlap them', async () => {
+    const builtin = [...BUILTIN_SKILL_NAMES][0];
+    await makeSkill(path.join(fx.repoPath, 'skills'), 'team-owned', 'team');
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
+      lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+      installedSkills: ['team-owned', builtin],
+      installedPaths: {
+        'team-owned': ['.claude/skills/team-owned'],
+        [builtin]: [`.claude/skills/${builtin}`],
+      },
+    });
+    const ctx = await buildClassifyContext(fx.localConfig);
+    expect(classifySkill('team-owned', ctx, path.join(fx.homeDir, '.claude', 'skills', 'team-owned'))).toEqual({ kind: 'team', namespace: undefined });
+    expect(classifySkill(builtin, ctx, path.join(fx.homeDir, '.claude', 'skills', builtin))).toEqual({ kind: 'builtin' });
+  });
+
+  it('retains path provenance for aliases publishing the same nested name', async () => {
+    for (const [source, tool] of [['alpha', 'claude'], ['beta', 'cursor']]) {
+      await fse.outputJson(getSourceManifestPath(source, fx.localConfig), {
+        lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+        installedSkills: ['group/child'],
+        installedPaths: { 'group/child': [`.${tool}/skills/group/child`] },
+      });
+    }
+    const ctx = await buildClassifyContext(fx.localConfig);
+    expect(classifySkill('group/child', ctx, path.join(fx.homeDir, '.claude/skills/group/child'))).toEqual({ kind: 'source', name: 'alpha' });
+    expect(classifySkill('group/child', ctx, path.join(fx.homeDir, '.cursor/skills/group/child'))).toEqual({ kind: 'source', name: 'beta' });
+  });
+
   it.each(['malformed', 'unreadable'])('warns when source provenance cannot be determined: %s', async (failure) => {
     const { log } = await import('../utils/logger.js');
     vi.mocked(log.warn).mockClear();
@@ -284,6 +327,66 @@ describe('scanAgentSkills', () => {
     const names = view.skills.map((s) => s.name);
     expect(names).toContain('real-skill');
     expect(names).not.toContain('not-a-skill');
+  });
+
+  it('lists manifest-declared nested installs without treating bundled modules as skills', async () => {
+    const claudeDir = path.join(fx.homeDir, '.claude', 'skills');
+    const cursorDir = path.join(fx.homeDir, '.cursor', 'skills');
+    await makeSkill(claudeDir, 'group/deep/child', 'nested source');
+    await makeSkill(claudeDir, 'child', 'unrelated local');
+    await makeSkill(claudeDir, 'bundle', 'local bundle');
+    await makeSkill(claudeDir, 'bundle/modules/inner', 'bundled module');
+    await makeSkill(cursorDir, 'group', 'unrelated bundle');
+    await makeSkill(cursorDir, 'group/deep/child', 'unrelated nested local');
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
+      lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+      installedSkills: ['group/deep/child'],
+      installedPaths: { 'group/deep/child': ['.claude/skills/group/deep/child'] },
+    });
+
+    const views = await scanInstalledAgents(fx.localConfig, fx.teamConfig);
+    const claude = views.find((view) => view.agent.id === 'claude')!;
+    expect(claude.skills.map((skill) => skill.name)).toEqual(['bundle', 'child', 'group/deep/child']);
+    expect(claude.skills.find((skill) => skill.name === 'group/deep/child')).toMatchObject({
+      path: path.join(claudeDir, 'group/deep/child'),
+      description: 'nested source', source: { kind: 'source', name: 'partner' },
+    });
+    expect(claude.skills.find((skill) => skill.name === 'child')?.source).toEqual({ kind: 'local-only' });
+    expect(views.find((view) => view.agent.id === 'cursor')?.skills).toEqual([
+      expect.objectContaining({ name: 'group', source: { kind: 'local-only' } }),
+    ]);
+  });
+
+  it('finds nested source paths through a symlink without following unrelated module trees', async () => {
+    const claudeDir = path.join(fx.homeDir, '.claude', 'skills');
+    const storage = path.join(fx.tmpDir, 'source-storage');
+    await makeSkill(storage, 'child', 'symlinked source');
+    await fse.ensureDir(claudeDir);
+    await fse.ensureSymlink(storage, path.join(claudeDir, 'group'), 'dir');
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
+      lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+      installedSkills: ['group/child'],
+      installedPaths: { 'group/child': ['.claude/skills/group/child'] },
+    });
+    const views = await scanInstalledAgents(fx.localConfig, fx.teamConfig);
+    expect(views.find((view) => view.agent.id === 'claude')?.skills).toEqual([
+      expect.objectContaining({ name: 'group/child', source: { kind: 'source', name: 'partner' } }),
+    ]);
+  });
+
+  it('does not label another checkout’s recorded copy as the current installation', async () => {
+    const claudeDir = path.join(fx.homeDir, '.claude', 'skills');
+    await makeSkill(claudeDir, 'child', 'local');
+    const otherConfig = { ...fx.localConfig, repo: { ...fx.localConfig.repo, localPath: path.join(fx.tmpDir, 'other-team') } };
+    await fse.outputJson(getSourceManifestPath('partner', otherConfig), {
+      lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
+      installedSkills: ['group/child'],
+      installedPaths: { 'group/child': ['.claude/skills/child'] },
+    });
+    const views = await scanInstalledAgents(fx.localConfig, fx.teamConfig);
+    expect(views.find((view) => view.agent.id === 'claude')?.skills).toEqual([
+      expect.objectContaining({ name: 'child', source: { kind: 'local-only' } }),
+    ]);
   });
 });
 

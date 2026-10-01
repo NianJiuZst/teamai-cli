@@ -5,6 +5,7 @@ import { isCliOwnedSkillName } from './builtin-skills.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
 import { parseFrontmatter } from './utils/frontmatter.js';
 import { log } from './utils/logger.js';
+import { resolveReal } from './utils/path-safety.js';
 
 // ─── Local agent skill scanning ─────────────────────────
 //
@@ -22,7 +23,7 @@ export type SkillSource =
   | { kind: 'local-only' };
 
 export interface AgentSkill {
-  /** Skill directory name (matches <agent>/skills/<name>/). */
+  /** Skill directory name relative to the agent's skills root, including nesting. */
   name: string;
   /** Frontmatter description, trimmed and possibly truncated by callers. */
   description: string;
@@ -42,6 +43,10 @@ export interface ClassifyContext {
   teamSkills: Map<string, { namespace?: string }>;
   /** Skill names provided by external source repos. */
   sourceSkills: Map<string, string>;
+  /** Verified physical installation paths, scoped to the current team/destination. */
+  sourceSkillPaths: Map<string, string>;
+  /** Sources with path records must not claim unrecorded copies by name alone. */
+  pathTrackedSources: Set<string>;
 }
 
 /**
@@ -52,14 +57,26 @@ export async function buildClassifyContext(localConfig: LocalConfig): Promise<Cl
   const teamSkills = await collectTeamRepoSkills(localConfig.repo.localPath);
 
   let sourceSkills = new Map<string, string>();
+  const sourceSkillPaths = new Map<string, string>();
+  const pathTrackedSources = new Set<string>();
   try {
-    const { getSourceSkillOrigins } = await import('./source.js');
-    sourceSkills = await getSourceSkillOrigins(localConfig);
+    const { getSourceSkillOrigins, getSourcePathOwners, getSourceManifestPath } = await import('./source.js');
+    const origins = await getSourceSkillOrigins(localConfig);
+    for (const owner of await getSourcePathOwners()) {
+      const source = owner.sourceName;
+      if (!source) continue;
+      // Different aliases can publish the same name, so the first-name origin
+      // map cannot enumerate every owner. Verify each alias's scoped record.
+      if (owner.manifestPath !== getSourceManifestPath(source, localConfig)) continue;
+      if (!sourceSkillPaths.has(owner.path)) sourceSkillPaths.set(owner.path, source);
+      pathTrackedSources.add(source);
+    }
+    sourceSkills = origins;
   } catch (error) {
     log.warn(`Source provenance could not be determined: ${(error as Error).message}. Source labels may be incomplete; do not treat local-only as proof of local ownership.`);
   }
 
-  return { teamSkills, sourceSkills };
+  return { teamSkills, sourceSkills, sourceSkillPaths, pathTrackedSources };
 }
 
 /**
@@ -91,15 +108,20 @@ async function collectTeamRepoSkills(repoPath: string): Promise<Map<string, { na
 }
 
 /** Resolve a skill name to its source tag using the prebuilt context. */
-export function classifySkill(name: string, ctx: ClassifyContext): SkillSource {
+export function classifySkill(name: string, ctx: ClassifyContext, skillPath?: string): SkillSource {
   // Same rule as the push scan and uninstall: a name a pre-stub release deployed
   // is ours until the next pull prunes it, not a member's local-only skill.
   if (isCliOwnedSkillName(name)) return { kind: 'builtin' };
   if (ctx.teamSkills.has(name)) {
     return { kind: 'team', namespace: ctx.teamSkills.get(name)?.namespace };
   }
-  if (ctx.sourceSkills.has(name)) {
-    return { kind: 'source', name: ctx.sourceSkills.get(name)! };
+  const pathSource = skillPath && ctx.sourceSkillPaths.get(resolveReal(skillPath));
+  if (pathSource) return { kind: 'source', name: pathSource };
+  const nameSource = ctx.sourceSkills.get(name);
+  // Older scoped records may carry only names. Keep their exact-name fallback,
+  // but never use a basename alias or override a modern record's actual paths.
+  if (nameSource && (!skillPath || !ctx.pathTrackedSources.has(nameSource))) {
+    return { kind: 'source', name: nameSource };
   }
   return { kind: 'local-only' };
 }
@@ -120,8 +142,8 @@ export function formatSkillSource(source: SkillSource): string {
 
 /**
  * Walk a single agent's skills directory, returning one AgentSkill
- * per `<skillsDir>/<name>/SKILL.md`. Skips entries without SKILL.md
- * so unrelated directories don't get reported as broken skills.
+ * per `<skillsDir>/<name>/SKILL.md`, including known nested source installs.
+ * Do not recursively discover bundled modules as independent skills.
  */
 export async function scanAgentSkills(agent: ResolvedAgent, ctx: ClassifyContext): Promise<AgentSkillsView> {
   const skills: AgentSkill[] = [];
@@ -132,10 +154,23 @@ export async function scanAgentSkills(agent: ResolvedAgent, ctx: ClassifyContext
     return { agent, skills };
   }
 
-  const dirs = await listDirs(agent.absoluteSkillsPath);
-  for (const name of dirs) {
+  const names = new Set(await listDirs(agent.absoluteSkillsPath));
+  for (const [name, source] of ctx.sourceSkills) {
+    // Recorded names also find symlinked installs, whose physical path may sit
+    // outside this root. A name alone must not expose another tool's modules.
+    if (!ctx.pathTrackedSources.has(source)
+      || ctx.sourceSkillPaths.has(resolveReal(path.join(agent.absoluteSkillsPath, name)))) names.add(name);
+  }
+  const physicalRoot = resolveReal(agent.absoluteSkillsPath);
+  for (const installedPath of ctx.sourceSkillPaths.keys()) {
+    const relative = path.relative(physicalRoot, installedPath);
+    if (relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+      names.add(relative.split(path.sep).join('/'));
+    }
+  }
+  for (const name of names) {
     // Skip hidden directories (e.g. .system) and workspace scratch dirs
-    if (name.startsWith('.') || name.endsWith('-workspace')) continue;
+    if (name.split('/').some((part) => part.startsWith('.') || part.endsWith('-workspace'))) continue;
     const skillDir = path.join(agent.absoluteSkillsPath, name);
     const skillMd = path.join(skillDir, 'SKILL.md');
     if (!await pathExists(skillMd)) continue;
@@ -144,7 +179,7 @@ export async function scanAgentSkills(agent: ResolvedAgent, ctx: ClassifyContext
       name,
       description,
       path: skillDir,
-      source: classifySkill(name, ctx),
+      source: classifySkill(name, ctx, skillDir),
     });
   }
 

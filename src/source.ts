@@ -316,13 +316,16 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
   // The shared lifecycle lock keeps source ownership stable through removal.
   const cleanupPaths: string[] = [];
   const retainedSkills: string[] = [];
+  const retainedPaths: Record<string, string[]> = {};
   if (manifest) {
     const baseDir = resolveBaseDir(localConfig);
     const otherOwners = await getSourcePathOwners(getSourceManifestPath(name, localConfig));
     const localTeamSkills = await getLocalTeamSkillNames(teamConfig, localConfig);
     for (const skill of manifest.installedSkills) {
-      if (isLocalTeamSkill(skill, localTeamSkills)) {
+      if (isLocalTeamSkill(skill, localTeamSkills)
+        || hasNestedSourceOwner(skill, manifest, teamConfig, localConfig, baseDir, otherOwners)) {
         retainedSkills.push(skill);
+        retainedPaths[skill] = getRetainedSkillPaths(skill, manifest, teamConfig, localConfig, baseDir);
         continue;
       }
       cleanupPaths.push(...await getSkillRemovalPaths(skill, teamConfig, localConfig, baseDir, otherOwners, manifest.installedPaths?.[skill]));
@@ -353,12 +356,12 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
 
   // Protected files must not lose their provenance and become push candidates.
   if (manifest && retainedSkills.length > 0) {
-    const retainedPaths = manifest.installedPaths && Object.fromEntries(
-      retainedSkills.filter((skill) => manifest.installedPaths?.[skill] !== undefined)
-        .map((skill) => [skill, manifest.installedPaths![skill]]),
-    );
-    await saveSourceManifest(name, localConfig, { ...manifest, installedSkills: retainedSkills, installedPaths: retainedPaths });
-    log.warn(`Retained source ownership for ${retainedSkills.length} skill(s) overlapping team or builtin content. Review ${getSourceManifestPath(name, localConfig)} before retiring that tracking.`);
+    await saveSourceManifest(name, localConfig, {
+      ...manifest, destinationRoot: path.resolve(resolveBaseDir(localConfig)),
+      teamCheckout: path.resolve(localConfig.repo.localPath),
+      installedSkills: retainedSkills, installedPaths: retainedPaths,
+    });
+    log.warn(`Retained source ownership for ${retainedSkills.length} skill(s) overlapping team, builtin, or nested source content. Review ${getSourceManifestPath(name, localConfig)} before retiring that tracking.`);
   } else {
     // Other projects may still use this source's shared clone and manifests.
     await remove(getSourceManifestPath(name, localConfig));
@@ -612,19 +615,19 @@ async function pullSingleSource(
 
   // Deploy skills to tool paths
   const deployed: string[] = [];
-  const protectedOldSkills = [...oldInstalled].filter((skill) => isLocalTeamSkill(skill, localTeamSkills));
+  const protectedOldSkills = [...oldInstalled].filter((skill) => isLocalTeamSkill(skill, localTeamSkills)
+    || hasNestedSourceOwner(skill, oldManifest!, teamConfig, localConfig, baseDir, otherOwners));
   if (repositoryChanged && protectedOldSkills.length > 0) {
-    log.warn(`[source:${source.name}] Cannot replace this installation while prior source paths overlap team or builtin content. Keeping its provenance for manual review: ${getSourceManifestPath(source.name, localConfig)}`);
+    log.warn(`[source:${source.name}] Cannot replace this installation while prior source paths overlap team, builtin, or nested source content. Keeping its provenance for manual review: ${getSourceManifestPath(source.name, localConfig)}`);
     return;
   }
   const retained = new Set(protectedOldSkills);
   const installedPaths: Record<string, string[]> = {};
   for (const skill of protectedOldSkills) {
-    const previousPaths = oldManifest?.installedPaths?.[skill];
-    if (previousPaths) installedPaths[skill] = previousPaths;
+    installedPaths[skill] = getRetainedSkillPaths(skill, oldManifest!, teamConfig, localConfig, baseDir);
   }
   if (protectedOldSkills.length > 0) {
-    log.warn(`[source:${source.name}] Keeping source provenance for paths overlapping team or builtin content; review ${getSourceManifestPath(source.name, localConfig)} before retiring that tracking.`);
+    log.warn(`[source:${source.name}] Keeping source provenance for paths overlapping team, builtin, or nested source content; review ${getSourceManifestPath(source.name, localConfig)} before retiring that tracking.`);
   }
   let newCount = 0;
   let updatedCount = 0;
@@ -656,6 +659,24 @@ async function pullSingleSource(
     if (targets.length > 0) plans.push({ skill, targets, conflictingPath, conflictingRecord });
   }
 
+  // Directory copies merge content. Crossing an existing parent/child boundary
+  // would either strand withdrawn descendants or adopt their bytes under a new
+  // identity. Keep the whole installation unchanged until ownership is reviewed.
+  const previousTargets = [...oldInstalled].flatMap((skill) =>
+    (oldManifest?.installedPaths?.[skill] ?? Object.values(scopedToolPaths(teamConfig, localConfig))
+      .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skill)] : []))
+      .map((target) => ({ path: resolveReal(path.resolve(baseDir, target)), skillName: skill })));
+  const plannedTargets = plans.flatMap((plan) => plan.targets.map((target) => ({ path: resolveReal(target), skillName: plan.skill.name })));
+  for (const target of plannedTargets) {
+    const overlap = [...previousTargets, ...otherOwners, ...plannedTargets]
+      .find((owned) => pathsOverlap(owned.path, target.path)
+        && (owned.path !== target.path || owned.skillName !== target.skillName));
+    if (overlap) {
+      log.warn(`[source:${source.name}] Cannot change overlapping skill directory boundaries: ${target.path} overlaps ${overlap.path}. Keeping the previous installation unchanged. Manual review is required: back up retained files, remove the affected source installation(s), then pull again. Ownership record: ${getSourceManifestPath(source.name, localConfig)}`);
+      return;
+    }
+  }
+
   // A repository replacement cannot retain old content under the new identity.
   // Preflight every skill before writing so a conflict preserves the old record
   // and files intact, without leaving unrecorded partial replacements behind.
@@ -665,14 +686,17 @@ async function pullSingleSource(
     return;
   }
 
+  // Validate retained fallback paths before any unrelated plan can write.
+  for (const { skill, conflictingPath } of plans) {
+    if (conflictingPath && oldInstalled.has(skill.name)) {
+      retained.add(skill.name);
+      installedPaths[skill.name] = getRetainedSkillPaths(skill.name, oldManifest!, teamConfig, localConfig, baseDir);
+    }
+  }
+
   for (const { skill, targets, conflictingPath, conflictingRecord } of plans) {
     if (conflictingPath) {
       log.warn(`[source:${source.name}] Skipping "${skill.name}": another source repository owns ${conflictingPath}. Remove that installation before pulling this skill. Ownership record: ${conflictingRecord}`);
-      if (oldInstalled.has(skill.name)) {
-        retained.add(skill.name);
-        const previousPaths = oldManifest?.installedPaths?.[skill.name];
-        if (previousPaths) installedPaths[skill.name] = previousPaths;
-      }
       continue;
     }
 
@@ -854,12 +878,37 @@ function isLocalTeamSkill(name: string, teamSkills: Set<string>): boolean {
 
 interface SourcePathOwner {
   path: string;
+  skillName?: string;
+  sourceName?: string;
   manifestPath?: string;
   repositoryId?: string;
 }
 
 function pathsOverlap(first: string, second: string): boolean {
   return first === second || first.startsWith(second + path.sep) || second.startsWith(first + path.sep);
+}
+
+/** Preserve validated fallback destinations from older scoped records too. */
+function getRetainedSkillPaths(skill: string, manifest: SourceInstallManifest, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string): string[] {
+  const paths = manifest.installedPaths?.[skill] ?? Object.values(scopedToolPaths(teamConfig, localConfig))
+    .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skill)] : []);
+  return paths.map((target) => {
+    const absolute = path.resolve(baseDir, target);
+    assertWithinRoot(baseDir, absolute);
+    const relative = path.relative(baseDir, absolute);
+    if (!isRelativeDescendant(relative)) throw new Error('Refusing to retain a source destination root');
+    return relative;
+  });
+}
+
+/** A descendant owner cannot account for all bytes retained in its parent. */
+function hasNestedSourceOwner(skill: string, manifest: SourceInstallManifest, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, otherOwners: SourcePathOwner[]): boolean {
+  const paths = manifest.installedPaths?.[skill] ?? Object.values(scopedToolPaths(teamConfig, localConfig))
+    .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skill)] : []);
+  return paths.some((target) => {
+    const physical = resolveReal(path.resolve(baseDir, target));
+    return otherOwners.some((owner) => owner.path.startsWith(physical + path.sep));
+  });
 }
 
 /** Foreign ownership can veto writes/deletion, never authorize them. */
@@ -885,7 +934,7 @@ export async function getSourcePathOwners(currentManifest?: string): Promise<Sou
           const target = path.resolve(root, installedPath);
           const relative = path.relative(root, target);
           if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
-          owners.push({ path: resolveReal(target), manifestPath, repositoryId: manifest.repositoryId });
+          owners.push({ path: resolveReal(target), skillName: skill, sourceName: name, manifestPath, repositoryId: manifest.repositoryId });
         }
       }
     }

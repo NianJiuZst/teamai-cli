@@ -114,7 +114,7 @@ export async function skillShow(name: string, options: GlobalOptions): Promise<v
   // only knows the deployed stub, so classifying by name would call `core` local-only.
   const source: SkillSource = resolved.primaryOrigin === 'builtin'
     ? { kind: 'builtin' }
-    : classifySkill(resolvedName, await buildClassifyContext(localConfig));
+    : classifySkill(resolvedName, await buildClassifyContext(localConfig), resolved.primaryPath);
 
   const description = truncate(await readSkillDescription(path.join(resolved.primaryPath, 'SKILL.md')), DESCRIPTION_MAX);
   const contributors = await SkillsHandler.readContributors(resolved.primaryPath);

@@ -113,24 +113,6 @@ teamai recall <q>  # Search what the team has already learned
 teamai env exec -- <cmd>  # Run a CLI with this directory's team env and secrets
 ```
 
-Git subscription caches are keyed by repository URL hash and shared across aliases, so the same URL shares its revision and TTL while different URLs remain isolated. Changing the URL uses the newly configured repository’s cache; a failed pull uses only that repository's cache. `source remove` retains repository caches for other installations.
-
-Git source installations are keyed by team checkout and destination (HOME, project, or worktree). `source remove` releases the current installation and retains shared caches/other owners. It can still clean a scoped record after another destination removed the alias from shared team configuration. If that alias was re-added for a different repository, stale or unidentified records authorize only local cleanup and preserve the new subscription. Physical paths remain until their last source owner releases them.
-
-Pull skips a skill when a different or unidentified repository owns an overlapping target; same-repository installations can share it. Existing copies survive conflicts, and a conflicting repository replacement preserves the old installation. A successful replacement records only its new destinations. Dry-run does not change skills or installation manifests.
-
-Push quarantines ambiguous legacy names and other installations' skills at the current physical target; unreadable ownership stops skill publication. Legacy records never authorize deletion. Pull active sources, review all old copies, and only then archive legacy tracking manually. This may temporarily hide unrelated same-named drafts. Moved/deleted checkouts do not automatically release ownership: review the record identified in warnings. New records include the checkout/destination; automatic legacy migration and orphan cleanup are not implemented.
-
-Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state and reads existing caches, without cloning, pulling, or updating cache timestamps. Uncached previews report that skill contents cannot yet be inspected. Skill push is also withheld when a source transaction is active.
-
-A successful source pull records only its current destinations and releases obsolete tool paths, including when the repository URL is unchanged. A valid source config with no `publicSkills`, an empty list, or no remaining published skill directories releases the previous installation. Files still owned by another installation remain protected; a missing or unreadable source config leaves the old installation untouched. Conflict-retained copies keep their previous records.
-
-Public skill names and recorded skill identities must already be canonical (no normalization-changing segments, repeated separators, backslashes, or trailing slash), so alternate spellings cannot bypass team-skill priority. Canonical nested names also respect local-team and builtin skill directory ownership, including ancestor/descendant conflicts. When this protection leaves previous source files in place, pull/removal retains their scoped provenance and excludes their paths from push pending manual review; it does not silently adopt them as team content. Source removal preflights all foreign ownership records and deletion targets before editing shared configuration. Ownership records must contain safe relative skill names and non-empty relative descendant paths; root-equivalent, escaping, and absolute paths stop cleanup before configuration or files are changed.
-
-If scoped provenance cannot be read, status/skill inspection warns that source labels are incomplete; a local-only label is not proof of local ownership.
-
-Do not run source installation/removal and push concurrently. The source mutex serializes source mutations, but push does not retain it through its entire staging/publication transaction; full cross-command snapshot isolation remains a limitation.
-
 Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 
