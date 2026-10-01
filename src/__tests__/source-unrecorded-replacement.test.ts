@@ -17,9 +17,14 @@ vi.mock('../utils/fs.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/fs.js')>();
   return { ...actual, copyDir: vi.fn(actual.copyDir) };
 });
+vi.mock('../config.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../config.js')>(),
+  autoDetectInit: vi.fn(),
+}));
 
+import { autoDetectInit } from '../config.js';
 import { getHandler } from '../resources/index.js';
-import { getSourceManifestPath, getSourcePushQuarantineNames, getSourceSkillOrigins, pullSources } from '../source.js';
+import { getSourceManifestPath, getSourcePushQuarantineNames, getSourceSkillOrigins, pullSources, sourceRemove } from '../source.js';
 import { copyDir } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import type { LocalConfig, SourceInstallManifest, TeamaiConfig } from '../types.js';
@@ -179,14 +184,63 @@ describe('repository replacement with unrecorded source destinations', () => {
     expect(await getSourcePushQuarantineNames(other)).toEqual(new Set());
   });
 
-  it.each(['update', 'withdraw'])('keeps same-producer plain-path fallback compatible: %s', async (action) => {
+  const unrecordedActions = ['missing', 'empty', 'mixed'].flatMap((paths) =>
+    ['update', 'withdraw', 'remove'].flatMap((action) => [false, true].map((dryRun) => ({ paths, action, dryRun }))));
+
+  it.each(unrecordedActions)('retains same-producer unrecorded claims after tool paths change: $paths, $action, preview $dryRun', async ({ paths, action, dryRun }) => {
+    const names = ['legacy', 'recorded'];
+    for (const name of names) {
+      await fse.outputFile(path.join(home, '.claude/skills', name, 'SKILL.md'), `# Original ${name}\n`);
+      await fse.outputFile(path.join(home, '.codex/skills', name, 'SKILL.md'), `# Unrelated new-path ${name}\n`);
+    }
+    team.toolPaths = { codex: { skills: '.codex/skills' } };
+    const yamlPath = path.join(config.repo.localPath, 'teamai.yaml');
+    await fse.writeFile(yamlPath, YAML.stringify(team));
+    const yamlBefore = await fse.readFile(yamlPath, 'utf8');
+    const manifest: SourceInstallManifest = {
+      destinationRoot: home, teamCheckout: config.repo.localPath, repositoryId,
+      lastPull: new Date(0).toISOString(), installedSkills: names,
+    };
+    if (paths === 'empty') manifest.installedPaths = { legacy: [], recorded: [] };
+    if (paths === 'mixed') manifest.installedPaths = { recorded: ['.claude/skills/recorded'] };
+    const manifestPath = await record(manifest);
+    const before = await fse.readFile(manifestPath, 'utf8');
+    await publish(action === 'update' ? ['free', ...names] : []);
+
+    if (action === 'remove') {
+      vi.mocked(autoDetectInit).mockResolvedValue({ localConfig: config, teamConfig: team });
+      await sourceRemove('shared', { dryRun });
+    } else await pullSources(config, { force: true, dryRun });
+
+    expect(await fse.readFile(manifestPath, 'utf8')).toBe(before);
+    expect(await fse.readFile(yamlPath, 'utf8')).toBe(yamlBefore);
+    for (const name of names) {
+      expect(await fse.readFile(path.join(home, '.claude/skills', name, 'SKILL.md'), 'utf8')).toBe(`# Original ${name}\n`);
+      expect(await fse.readFile(path.join(home, '.codex/skills', name, 'SKILL.md'), 'utf8')).toBe(`# Unrelated new-path ${name}\n`);
+    }
+    for (const tool of ['.claude', '.codex']) expect(await fse.pathExists(path.join(home, tool, 'skills/free'))).toBe(false);
+    expect(copyDir).not.toHaveBeenCalled();
+    expect(await getSourcePushQuarantineNames(config)).toEqual(new Set(names));
+    expect(await getSourceSkillOrigins(config)).toEqual(new Map(names.map((name) => [name, 'shared'])));
+    expect(vi.mocked(log.warn).mock.calls.some(([message]) => /manual review/i.test(String(message)))).toBe(true);
+  });
+
+  it.each(['update', 'withdraw', 'remove'])('keeps explicitly recorded plain paths compatible: %s', async (action) => {
     await fse.outputFile(path.join(home, '.claude/skills/legacy/SKILL.md'), '# Previous revision\n');
     await record({
       destinationRoot: home, teamCheckout: config.repo.localPath, repositoryId,
       lastPull: new Date(0).toISOString(), installedSkills: ['legacy'],
+      installedPaths: { legacy: ['.claude/skills/legacy'] },
     });
     await publish(action === 'update' ? ['legacy', 'free'] : []);
 
+    if (action === 'remove') {
+      vi.mocked(autoDetectInit).mockResolvedValue({ localConfig: config, teamConfig: team });
+      await sourceRemove('shared', {});
+      expect(await fse.pathExists(getSourceManifestPath('shared', config))).toBe(false);
+      expect(await fse.pathExists(path.join(home, '.claude/skills/legacy'))).toBe(false);
+      return;
+    }
     await pullSources(config, { force: true });
 
     const after = await fse.readJson(getSourceManifestPath('shared', config)) as SourceInstallManifest;

@@ -342,6 +342,15 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
     log.error(`Source "${name}" not found. Run \`teamai source list\` to see configured sources.`);
     return;
   }
+  if (manifest?.installedSkills.some((skill) => !manifest.installedPaths?.[skill]?.length)) {
+    log.warn(`[source:${name}] Cannot remove an installation with unrecorded destinations. Keeping all files, configuration, and provenance unchanged. Manual review is required: review ${getSourceManifestPath(name, localConfig)} and the original deployment paths before retiring this claim.`);
+    return;
+  }
+  const ambiguousClaim = await findAmbiguousSourceClaim(manifest?.installedSkills ?? [], getSourceManifestPath(name, localConfig));
+  if (ambiguousClaim) {
+    log.warn(`[source:${name}] Cannot remove skills overlapping ambiguous source ownership. Keeping all files, configuration, and provenance unchanged. Manual review is required: ${ambiguousClaim}`);
+    return;
+  }
 
   // A shared checkout may have re-used this alias for a different producer.
   // Old (or unidentified) scoped ownership only authorizes local cleanup.
@@ -357,17 +366,17 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
   const retainedPaths: Record<string, string[]> = {};
   if (manifest) {
     const baseDir = resolveBaseDir(localConfig);
-    await assertSourceDestinationsUnchanged(manifest, teamConfig, localConfig, baseDir);
+    await assertSourceDestinationsUnchanged(manifest, baseDir);
     const otherOwners = await getSourcePathOwners(getSourceManifestPath(name, localConfig));
     const localTeamSkills = await getLocalTeamSkillNames(teamConfig, localConfig);
     for (const skill of manifest.installedSkills) {
       if (isLocalTeamSkill(skill, localTeamSkills)
-        || hasNestedSourceOwner(skill, manifest, teamConfig, localConfig, baseDir, otherOwners)) {
+        || hasNestedSourceOwner(skill, manifest, baseDir, otherOwners)) {
         retainedSkills.push(skill);
-        retainedPaths[skill] = getRetainedSkillPaths(skill, manifest, teamConfig, localConfig, baseDir);
+        retainedPaths[skill] = getRetainedSkillPaths(skill, manifest, baseDir);
         continue;
       }
-      cleanupPaths.push(...await getSkillRemovalPaths(skill, teamConfig, localConfig, baseDir, otherOwners, manifest.installedPaths?.[skill], manifest.installedPhysicalPaths));
+      cleanupPaths.push(...await getSkillRemovalPaths(skill, baseDir, otherOwners, manifest.installedPaths?.[skill], manifest.installedPhysicalPaths));
     }
   }
 
@@ -657,11 +666,16 @@ async function pullSingleSource(
   const oldInstalled = new Set(oldManifest?.installedSkills ?? []);
   const repositoryId = getSourceRepoId(source);
   const repositoryChanged = !!oldManifest && oldManifest.repositoryId !== repositoryId;
-  if (repositoryChanged && [...oldInstalled].some((skill) => !oldManifest.installedPaths?.[skill]?.length)) {
-    log.warn(`[source:${source.name}] Cannot replace an installation with unrecorded destinations. Keeping all previous files and provenance unchanged. Manual review is required: review ${getSourceManifestPath(source.name, localConfig)} and the original deployment paths before retiring this claim.`);
+  if (oldManifest && [...oldInstalled].some((skill) => !oldManifest.installedPaths?.[skill]?.length)) {
+    log.warn(`[source:${source.name}] Cannot modify an installation with unrecorded destinations. Keeping all previous files and provenance unchanged. Manual review is required: review ${getSourceManifestPath(source.name, localConfig)} and the original deployment paths before retiring this claim.`);
     return;
   }
-  if (oldManifest) await assertSourceDestinationsUnchanged(oldManifest, teamConfig, localConfig, baseDir);
+  if (oldManifest) await assertSourceDestinationsUnchanged(oldManifest, baseDir);
+  const ambiguousClaim = await findAmbiguousSourceClaim([...oldInstalled, ...skillsToDeploy.map((skill) => skill.name)], getSourceManifestPath(source.name, localConfig));
+  if (ambiguousClaim) {
+    log.warn(`[source:${source.name}] Cannot modify skills overlapping ambiguous source ownership. Keeping the installation unchanged. Manual review is required: ${ambiguousClaim}`);
+    return;
+  }
 
   // Collect skills that belong to the local team (they take priority)
   const localTeamSkills = await getLocalTeamSkillNames(teamConfig, localConfig);
@@ -670,7 +684,7 @@ async function pullSingleSource(
   // Deploy skills to tool paths
   const deployed: string[] = [];
   const protectedOldSkills = [...oldInstalled].filter((skill) => isLocalTeamSkill(skill, localTeamSkills)
-    || hasNestedSourceOwner(skill, oldManifest!, teamConfig, localConfig, baseDir, otherOwners));
+    || hasNestedSourceOwner(skill, oldManifest!, baseDir, otherOwners));
   if (repositoryChanged && protectedOldSkills.length > 0) {
     log.warn(`[source:${source.name}] Cannot replace this installation while prior source paths overlap team, builtin, or nested source content. Keeping its provenance for manual review: ${getSourceManifestPath(source.name, localConfig)}`);
     return;
@@ -679,7 +693,7 @@ async function pullSingleSource(
   const installedPaths: Record<string, string[]> = {};
   const installedPhysicalPaths: Record<string, string> = {};
   for (const skill of protectedOldSkills) {
-    installedPaths[skill] = getRetainedSkillPaths(skill, oldManifest!, teamConfig, localConfig, baseDir);
+    installedPaths[skill] = getRetainedSkillPaths(skill, oldManifest!, baseDir);
     for (const target of installedPaths[skill]) installedPhysicalPaths[target] = getSourcePhysicalPin(oldManifest!, baseDir, target);
   }
   if (protectedOldSkills.length > 0) {
@@ -689,7 +703,7 @@ async function pullSingleSource(
   let updatedCount = 0;
 
   const previousTargets = [...oldInstalled].flatMap((skill) =>
-    getRetainedSkillPaths(skill, oldManifest!, teamConfig, localConfig, baseDir)
+    getRetainedSkillPaths(skill, oldManifest!, baseDir)
       .map((relative) => ({ path: getSourcePhysicalPin(oldManifest!, baseDir, relative), relative, skillName: skill })));
   const plannedTargets: Array<{ path: string; skillName: string; lexicalPath: string; replacesSymlink: boolean }> = [];
   const plans: Array<{ skill: (typeof skillsToDeploy)[number]; targets: string[]; codexSkillsPath?: string; conflictingPath?: string; conflictingRecord?: string }> = [];
@@ -752,11 +766,11 @@ async function pullSingleSource(
     return;
   }
 
-  // Validate retained fallback paths before any unrelated plan can write.
+  // Validate retained recorded paths before any unrelated plan can write.
   for (const { skill, conflictingPath } of plans) {
     if (conflictingPath && oldInstalled.has(skill.name)) {
       retained.add(skill.name);
-      installedPaths[skill.name] = getRetainedSkillPaths(skill.name, oldManifest!, teamConfig, localConfig, baseDir);
+      installedPaths[skill.name] = getRetainedSkillPaths(skill.name, oldManifest!, baseDir);
       for (const target of installedPaths[skill.name]) installedPhysicalPaths[target] = getSourcePhysicalPin(oldManifest!, baseDir, target);
     }
   }
@@ -838,8 +852,8 @@ async function pullSingleSource(
     for (const oldSkill of oldInstalled) {
       if (retained.has(oldSkill) || isLocalTeamSkill(oldSkill, localTeamSkills)) continue;
       const previousPaths = oldManifest?.installedPaths?.[oldSkill];
-      // Repository replacements with unrecorded claims already stop above.
-      await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, [...otherOwners, ...currentOwners], previousPaths, oldManifest?.installedPhysicalPaths);
+      // Any installation with unrecorded claims already stopped above.
+      await removeSkillFromToolPaths(oldSkill, baseDir, [...otherOwners, ...currentOwners], previousPaths, oldManifest?.installedPhysicalPaths);
     }
   }
 
@@ -989,6 +1003,28 @@ function isLocalTeamSkill(name: string, teamSkills: Set<string>): boolean {
     teamSkill === name || name.startsWith(`${teamSkill}/`) || teamSkill.startsWith(`${name}/`));
 }
 
+/** Missing history can veto an overlapping name, but cannot authorize a path. */
+async function findAmbiguousSourceClaim(skillNames: string[], currentManifest: string): Promise<string | undefined> {
+  if (skillNames.length === 0) return undefined;
+  const overlaps = (skill: string) => skillNames.some((name) =>
+    name === skill || name.startsWith(`${skill}/`) || skill.startsWith(`${name}/`));
+  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
+  for (const sourceName of await listDirs(sourcesDir)) {
+    const legacyPath = path.join(getSourceDir(sourceName), 'installed.json');
+    const legacy = await readSourceManifest(legacyPath);
+    if (legacy?.installedSkills.some(overlaps)) return legacyPath;
+    const installationsDir = path.join(getSourceDir(sourceName), 'installations');
+    for (const file of await listFiles(installationsDir)) {
+      const manifestPath = path.join(installationsDir, file);
+      if (manifestPath === currentManifest || !file.endsWith('.json')) continue;
+      const manifest = await readSourceManifest(manifestPath);
+      if (manifest?.installedSkills.some((skill) => overlaps(skill)
+        && (!manifest.destinationRoot || !manifest.installedPaths?.[skill]?.length))) return manifestPath;
+    }
+  }
+  return undefined;
+}
+
 interface SourcePathOwner {
   path: string;
   skillName?: string;
@@ -1022,9 +1058,9 @@ async function assertSourceSkillRootIsNotSymlink(target: string): Promise<void> 
   }
 }
 
-async function assertSourceDestinationsUnchanged(manifest: SourceInstallManifest, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string): Promise<void> {
+async function assertSourceDestinationsUnchanged(manifest: SourceInstallManifest, baseDir: string): Promise<void> {
   for (const skill of manifest.installedSkills) {
-    for (const relative of getRetainedSkillPaths(skill, manifest, teamConfig, localConfig, baseDir)) {
+    for (const relative of getRetainedSkillPaths(skill, manifest, baseDir)) {
       const target = path.resolve(baseDir, relative);
       await assertSourceSkillRootIsNotSymlink(target);
       if (await resolveSourcePhysicalPath(target) !== getSourcePhysicalPin(manifest, baseDir, relative)) {
@@ -1034,10 +1070,10 @@ async function assertSourceDestinationsUnchanged(manifest: SourceInstallManifest
   }
 }
 
-/** Preserve validated fallback destinations from older scoped records too. */
-function getRetainedSkillPaths(skill: string, manifest: SourceInstallManifest, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string): string[] {
-  const paths = manifest.installedPaths?.[skill] ?? Object.values(scopedToolPaths(teamConfig, localConfig))
-    .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skill)] : []);
+/** Retained ownership must come from recorded destinations, never today's config. */
+function getRetainedSkillPaths(skill: string, manifest: SourceInstallManifest, baseDir: string): string[] {
+  const paths = manifest.installedPaths?.[skill];
+  if (!paths?.length) throw new Error(`Source skill "${skill}" has unrecorded destinations. Manual review is required.`);
   return paths.map((target) => {
     const absolute = path.resolve(baseDir, target);
     assertWithinRoot(baseDir, absolute);
@@ -1048,9 +1084,8 @@ function getRetainedSkillPaths(skill: string, manifest: SourceInstallManifest, t
 }
 
 /** A descendant owner cannot account for all bytes retained in its parent. */
-function hasNestedSourceOwner(skill: string, manifest: SourceInstallManifest, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, otherOwners: SourcePathOwner[]): boolean {
-  const paths = manifest.installedPaths?.[skill] ?? Object.values(scopedToolPaths(teamConfig, localConfig))
-    .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skill)] : []);
+function hasNestedSourceOwner(skill: string, manifest: SourceInstallManifest, baseDir: string, otherOwners: SourcePathOwner[]): boolean {
+  const paths = getRetainedSkillPaths(skill, manifest, baseDir);
   return paths.some((target) => {
     const physical = getSourcePhysicalPin(manifest, baseDir, path.relative(baseDir, path.resolve(baseDir, target)));
     return otherOwners.some((owner) => owner.path.startsWith(physical + path.sep));
@@ -1093,12 +1128,11 @@ export async function getSourcePathOwners(currentManifest?: string): Promise<Sou
 }
 
 /** Plan deletion only after the last installation releases a recorded path. */
-async function getSkillRemovalPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, otherOwners: SourcePathOwner[], installedPaths?: string[], installedPhysicalPaths?: Record<string, string>): Promise<string[]> {
+async function getSkillRemovalPaths(skillName: string, baseDir: string, otherOwners: SourcePathOwner[], installedPaths?: string[], installedPhysicalPaths?: Record<string, string>): Promise<string[]> {
   if (!isCanonicalSkillName(skillName)) throw new Error('Invalid source skill name for cleanup');
+  if (!installedPaths?.length) throw new Error(`Source skill "${skillName}" has unrecorded destinations. Manual review is required.`);
   const removalPaths: string[] = [];
-  const paths = installedPaths ?? Object.values(scopedToolPaths(teamConfig, localConfig))
-    .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skillName)] : []);
-  for (const installedPath of paths) {
+  for (const installedPath of installedPaths) {
     const skillDir = path.resolve(baseDir, installedPath);
     assertWithinRoot(baseDir, skillDir);
     if (!isRelativeDescendant(path.relative(baseDir, skillDir))) throw new Error('Refusing to remove a source destination root');
@@ -1122,8 +1156,8 @@ async function getSkillRemovalPaths(skillName: string, teamConfig: TeamaiConfig,
   return removalPaths;
 }
 
-async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, otherOwners: SourcePathOwner[], installedPaths?: string[], installedPhysicalPaths?: Record<string, string>): Promise<void> {
-  for (const target of await getSkillRemovalPaths(skillName, teamConfig, localConfig, baseDir, otherOwners, installedPaths, installedPhysicalPaths)) {
+async function removeSkillFromToolPaths(skillName: string, baseDir: string, otherOwners: SourcePathOwner[], installedPaths?: string[], installedPhysicalPaths?: Record<string, string>): Promise<void> {
+  for (const target of await getSkillRemovalPaths(skillName, baseDir, otherOwners, installedPaths, installedPhysicalPaths)) {
     await remove(target);
   }
 }

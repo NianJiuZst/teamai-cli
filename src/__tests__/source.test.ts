@@ -637,6 +637,7 @@ describe('source', () => {
         repositoryId: createHash('sha256').update(teamConfig.sources[0].repo.trim()).digest('hex'),
         lastPull: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
         installedSkills: ['old-skill'],
+        installedPaths: { 'old-skill': ['.claude/skills/old-skill'] },
       };
       await fse.ensureDir(path.join(sourcesDir, 'platform'));
       await fse.outputJson(getSourceManifestPath('platform', localConfig), oldManifest);
@@ -792,14 +793,15 @@ describe('source', () => {
         await pullSources(localConfig, { force: true });
 
         expect(await fse.pathExists(path.join(homeDir, ownPath, 'SKILL.md')))
-          .toBe(['same', 'nested', 'ancestor', 'symlink'].includes(ownership));
+          .toBe(['same', 'nested', 'ancestor', 'symlink', 'unknown-root'].includes(ownership));
         expect(await fse.readFile(otherManifestPath, 'utf8')).toBe(otherManifest);
         const current = await fse.readJson(getSourceManifestPath('platform', localConfig)) as SourceInstallManifest;
         expect(current.destinationRoot).toBe(homeDir);
         expect(current.teamCheckout).toBe(localConfig.repo.localPath);
-        expect(current.installedSkills).toEqual(ownership === 'ancestor' ? ['old-skill']
+        expect(current.installedSkills).toEqual(['ancestor', 'unknown-root'].includes(ownership) ? ['old-skill']
           : ownership === 'nested' ? ['new-skill', 'old-skill'] : ['new-skill']);
-        expect(current.installedPaths?.['old-skill']).toEqual(['ancestor', 'nested'].includes(ownership) ? [ownPath] : undefined);
+        expect(current.installedPaths?.['old-skill']).toEqual(['ancestor', 'nested', 'unknown-root'].includes(ownership) ? [ownPath] : undefined);
+        if (ownership === 'unknown-root') expect(await fse.pathExists(path.join(homeDir, '.claude/skills/new-skill'))).toBe(false);
       },
     );
 

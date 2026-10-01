@@ -148,11 +148,14 @@ describe('nested source ownership boundaries', () => {
 
   it.each([
     ['remove', true], ['remove', false], ['withdraw', true], ['withdraw', false],
-  ] as const)('retains parent provenance until its nested owner releases (%s, recorded paths: %s)', async (action, recordedPaths) => {
+  ] as const)('releases recorded parents after their child; unrecorded parents require manual review (%s, recorded paths: %s)', async (action, recordedPaths) => {
     const child: LocalConfig = { ...config, repo: { ...config.repo, localPath: path.join(root, 'child-team') } };
     const childTeam = { ...team, sources: [{ name: 'child', repo: producer }] };
     await saveTeam(child, childTeam);
     const parentManifest = await record('current', config, 'foo', recordedPaths ? '.claude/skills/foo' : undefined);
+    const parentBefore = await fse.readFile(parentManifest, 'utf8');
+    const teamYamlPath = path.join(config.repo.localPath, 'teamai.yaml');
+    const teamBefore = await fse.readFile(teamYamlPath, 'utf8');
     const childManifest = await record('child', child, 'foo/bar', '.claude/skills/foo/bar');
     const childBefore = await fse.readFile(childManifest, 'utf8');
     const parentFile = path.join(home, '.claude/skills/foo/SKILL.md');
@@ -174,7 +177,11 @@ describe('nested source ownership boundaries', () => {
 
     // Releasing a child must not strand the parent's other source files.
     await removeSource('child', child);
-    expect(await fse.pathExists(childManifest)).toBe(false);
+    expect(await fse.pathExists(childManifest)).toBe(!recordedPaths);
+    if (!recordedPaths) {
+      expect(await fse.readFile(childManifest, 'utf8')).toBe(childBefore);
+      expect(await fse.readFile(childFile, 'utf8')).toBe('# Nested source\n');
+    }
     expect(await fse.readFile(parentFile, 'utf8')).toBe('# Retained parent source\n');
     const parentBeforeFinalRemoval = await fse.readFile(parentManifest, 'utf8');
     const candidates = await pushCandidates(child);
@@ -185,9 +192,13 @@ describe('nested source ownership boundaries', () => {
     if (action === 'remove') await removeSource('current', config);
     else await pullSources(config, { force: true });
 
-    expect(await fse.pathExists(path.dirname(parentFile))).toBe(false);
+    expect(await fse.pathExists(path.dirname(parentFile))).toBe(!recordedPaths);
     expect(await fse.readFile(draft, 'utf8')).toBe('# Local draft\n');
-    if (action === 'remove') expect(await fse.pathExists(parentManifest)).toBe(false);
+    if (!recordedPaths) {
+      expect(await fse.readFile(parentManifest, 'utf8')).toBe(parentBefore);
+      expect(await fse.readFile(teamYamlPath, 'utf8')).toBe(teamBefore);
+      expect(await pushCandidates(config)).not.toContain('foo');
+    } else if (action === 'remove') expect(await fse.pathExists(parentManifest)).toBe(false);
     else expect((await fse.readJson(parentManifest)).installedSkills).toEqual([]);
   });
 });

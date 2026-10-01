@@ -104,17 +104,15 @@ it.each([
     expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBefore);
     expect(fs.readFileSync(teamYaml, 'utf8')).toBe(yamlBefore);
 
-    if (paths === 'missing') {
-      // Explicit cleanup can use this unchanged plain tool destination; it must
-      // not unsubscribe the replacement producer while retiring the old claim.
-      expect(run(['source', 'remove', 'shared'])).toContain('Removed source "shared"');
-      expect(fs.existsSync(manifestPath)).toBe(false);
-      expect(fs.existsSync(path.dirname(oldSkill))).toBe(false);
+    // Current tool settings cannot establish an unrecorded historical destination.
+    for (const args of [['source', 'remove', 'shared'], ['source', 'remove', 'shared', '--dry-run']]) {
+      const output = run(args);
+      expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBefore);
+      expect(fs.readFileSync(oldSkill, 'utf8')).toBe('# original old-skill\n');
       expect(fs.readFileSync(teamYaml, 'utf8')).toBe(yamlBefore);
-      run(['pull', '--force']);
-      expect(fs.readFileSync(path.join(skills, 'new-first', 'SKILL.md'), 'utf8')).toBe('# replacement new-first\n');
-      expect(fs.readFileSync(path.join(skills, 'new-second', 'SKILL.md'), 'utf8')).toBe('# replacement new-second\n');
-      expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).installedSkills).toEqual(['new-first', 'new-second']);
+      expect(fs.existsSync(path.join(skills, 'new-first'))).toBe(false);
+      expect(fs.existsSync(path.join(skills, 'new-second'))).toBe(false);
+      expect(output.toLowerCase()).toContain('manual');
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
