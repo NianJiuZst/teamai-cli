@@ -20,7 +20,7 @@ import {
 } from './utils/fs.js';
 import { getHandler } from './resources/index.js';
 import { ResourceHandler } from './resources/base.js';
-import { resolveSkillDestination } from './resources/skills.js';
+import { CODEX_TOOL, resolveSkillDestination } from './resources/skills.js';
 import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { getUserHome } from './utils/home.js';
 import { acquireLock, releaseLock } from './update.js';
@@ -635,12 +635,20 @@ async function pullSingleSource(
 
   // Find actual skill directories in the source repo
   const skillsDir = path.join(repoDir, 'skills');
+  const physicalRepoDir = await resolveSourcePhysicalPath(repoDir);
   const skillsToDeploy: Array<{ name: string; sourcePath: string }> = [];
 
   for (const skillName of publicSkills) {
     const skillPath = await findSkillInRepo(skillsDir, skillName);
     if (skillPath) {
-      skillsToDeploy.push({ name: skillName, sourcePath: skillPath });
+      const physicalSource = await resolveSourcePhysicalPath(skillPath);
+      if ((await fse.lstat(skillPath)).isSymbolicLink()
+        && !isRelativeDescendant(path.relative(physicalRepoDir, physicalSource))) {
+        throw new Error(`Source skill root symlink leaves its repository cache: ${skillPath}. Manual review is required.`);
+      }
+      // Copy concrete contents, never install a root link whose later physical
+      // cleanup could delete its referent. In-repository aliases remain valid.
+      skillsToDeploy.push({ name: skillName, sourcePath: physicalSource });
     }
   }
 
@@ -680,7 +688,7 @@ async function pullSingleSource(
     getRetainedSkillPaths(skill, oldManifest!, teamConfig, localConfig, baseDir)
       .map((relative) => ({ path: getSourcePhysicalPin(oldManifest!, baseDir, relative), relative, skillName: skill })));
   const plannedTargets: Array<{ path: string; skillName: string; lexicalPath: string; replacesSymlink: boolean }> = [];
-  const plans: Array<{ skill: (typeof skillsToDeploy)[number]; targets: string[]; conflictingPath?: string; conflictingRecord?: string }> = [];
+  const plans: Array<{ skill: (typeof skillsToDeploy)[number]; targets: string[]; codexSkillsPath?: string; conflictingPath?: string; conflictingRecord?: string }> = [];
   for (const skill of skillsToDeploy) {
     // Local team skills take priority: skip source skill if name conflicts
     if (isLocalTeamSkill(skill.name, localTeamSkills)) {
@@ -691,11 +699,13 @@ async function pullSingleSource(
     // Resolve without a source path: the Codex resolver's duplicate cleanup
     // must not delete a path before cross-installation ownership is checked.
     const targets: string[] = [];
+    let codexSkillsPath: string | undefined;
     let conflictingPath: string | undefined;
     let conflictingRecord: string | undefined;
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills || !await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
       const target = await resolveSkillDestination(tool, toolPath.skills, baseDir, skill.name);
+      if (tool === CODEX_TOOL && target !== path.join(baseDir, toolPath.skills, skill.name)) codexSkillsPath = toolPath.skills;
       targets.push(target);
       const destination = await resolveSourceCopyDestination(target);
       const physical = destination.path;
@@ -709,7 +719,7 @@ async function pullSingleSource(
         conflictingRecord = owner.manifestPath;
       }
     }
-    if (targets.length > 0) plans.push({ skill, targets, conflictingPath, conflictingRecord });
+    if (targets.length > 0) plans.push({ skill, targets, codexSkillsPath, conflictingPath, conflictingRecord });
   }
 
   // Directory copies merge content. Crossing an existing parent/child boundary
@@ -744,6 +754,42 @@ async function pullSingleSource(
       retained.add(skill.name);
       installedPaths[skill.name] = getRetainedSkillPaths(skill.name, oldManifest!, teamConfig, localConfig, baseDir);
       for (const target of installedPaths[skill.name]) installedPhysicalPaths[target] = getSourcePhysicalPin(oldManifest!, baseDir, target);
+    }
+  }
+
+  // Codex's shared-directory preference may leave a verified duplicate in its
+  // configured directory. Validate every optional reconciliation before the
+  // resolver is allowed to delete anything; owned paths stay with lifecycle
+  // cleanup, and planned destinations (including physical aliases) must survive.
+  const reconciliations: Array<{ skill: (typeof skillsToDeploy)[number]; skillsPath: string; target: string; physical: string }> = [];
+  for (const { skill, codexSkillsPath, conflictingPath } of plans) {
+    if (!codexSkillsPath || conflictingPath) continue;
+    const target = path.join(baseDir, codexSkillsPath, skill.name);
+    assertWithinRoot(baseDir, target);
+    if (!isRelativeDescendant(path.relative(baseDir, target))) throw new Error('Refusing to reconcile a source destination root');
+    const physical = await resolveSourcePhysicalPath(target);
+    if (!await pathExists(target)) continue;
+    const physicalRoot = await resolveSourcePhysicalPath(baseDir);
+    if (physical === path.parse(physical).root || physical === physicalRoot || physicalRoot.startsWith(physical + path.sep)) {
+      throw new Error('Refusing to reconcile a source destination root or ancestor');
+    }
+    if (pathsOverlap(physical, physicalRepoDir) || skillsToDeploy.some((input) => pathsOverlap(physical, input.sourcePath))) {
+      log.warn(`[source:${source.name}] Keeping Codex duplicate that overlaps the source repository cache: ${target}. Manual review is required.`);
+      continue;
+    }
+    if ([...otherOwners, ...previousTargets, ...plannedTargets].some((owner) => pathsOverlap(owner.path, physical))
+      || previousTargets.some((owner) => pathsOverlap(path.resolve(baseDir, owner.relative), target))
+      || plannedTargets.some((planned) => pathsOverlap(planned.lexicalPath, target))) continue;
+    reconciliations.push({ skill, skillsPath: codexSkillsPath, target, physical });
+  }
+  if (!options.dryRun) {
+    for (const { skill, skillsPath, target, physical } of reconciliations) {
+      if (await resolveSourcePhysicalPath(target) !== physical) {
+        throw new Error(`Source destination changed before Codex reconciliation: ${target}. Manual review is required.`);
+      }
+      // The existing resolver alone decides whether both copies and the
+      // incoming source match. Different local drafts are never removed.
+      await resolveSkillDestination(CODEX_TOOL, skillsPath, baseDir, skill.name, skill.sourcePath);
     }
   }
 
@@ -878,9 +924,18 @@ async function findSkillInRepo(skillsDir: string, skillName: string): Promise<st
   if (!isCanonicalSkillName(skillName)) throw new Error('Invalid source skill name');
   if (!await pathExists(skillsDir)) return null;
 
+  const containsSkill = async (candidate: string): Promise<boolean> => {
+    try {
+      if ((await fse.lstat(candidate)).isSymbolicLink()) await resolveSourcePhysicalPath(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    return pathExists(path.join(candidate, 'SKILL.md'));
+  };
+
   // Check flat layout first: skills/<name>/SKILL.md
   const flatPath = path.join(skillsDir, skillName);
-  if (await pathExists(path.join(flatPath, 'SKILL.md'))) {
+  if (await containsSkill(flatPath)) {
     return flatPath;
   }
 
@@ -888,7 +943,7 @@ async function findSkillInRepo(skillsDir: string, skillName: string): Promise<st
   const topDirs = await listDirs(skillsDir);
   for (const ns of topDirs) {
     const nsPath = path.join(skillsDir, ns, skillName);
-    if (await pathExists(path.join(nsPath, 'SKILL.md'))) {
+    if (await containsSkill(nsPath)) {
       return nsPath;
     }
   }
@@ -953,10 +1008,22 @@ function getSourcePhysicalPin(manifest: Pick<SourceInstallManifest, 'installedPh
   return path.resolve(baseDir, relative);
 }
 
+/** Older writers could install a root link without owning its referent. */
+async function assertSourceSkillRootIsNotSymlink(target: string): Promise<void> {
+  try {
+    if ((await fse.lstat(target)).isSymbolicLink()) {
+      throw new Error(`Installed source skill root is a symlink: ${target}. Keeping the installation unchanged. Manual review is required; review the link, its referent, and the retained ownership record before retrying.`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
 async function assertSourceDestinationsUnchanged(manifest: SourceInstallManifest, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string): Promise<void> {
   for (const skill of manifest.installedSkills) {
     for (const relative of getRetainedSkillPaths(skill, manifest, teamConfig, localConfig, baseDir)) {
       const target = path.resolve(baseDir, relative);
+      await assertSourceSkillRootIsNotSymlink(target);
       if (await resolveSourcePhysicalPath(target) !== getSourcePhysicalPin(manifest, baseDir, relative)) {
         throw new Error(`Source destination changed or has an unverified symlink: ${target}. Keeping the installation unchanged. Manual review is required; restore the original destination before retrying, or review the retained files and ownership record.`);
       }
@@ -1032,6 +1099,7 @@ async function getSkillRemovalPaths(skillName: string, teamConfig: TeamaiConfig,
     const skillDir = path.resolve(baseDir, installedPath);
     assertWithinRoot(baseDir, skillDir);
     if (!isRelativeDescendant(path.relative(baseDir, skillDir))) throw new Error('Refusing to remove a source destination root');
+    await assertSourceSkillRootIsNotSymlink(skillDir);
     const physicalPath = await resolveSourcePhysicalPath(skillDir);
     if (physicalPath !== getSourcePhysicalPin({ installedPhysicalPaths }, baseDir, path.relative(baseDir, skillDir))) {
       throw new Error(`Source destination changed before cleanup: ${skillDir}. Manual review is required.`);
