@@ -298,6 +298,7 @@ describe('source', () => {
       await fse.outputFile(path.join(localConfig.repo.localPath, 'skills/team-skill/SKILL.md'), '# Team owned');
       const target = path.join(homeDir, '.claude/skills', name, 'run.sh');
       await fse.outputFile(target, '# Preserve team script');
+      await fse.outputFile(path.join(homeDir, '.claude/skills', owner, 'SKILL.md'), '# Team-owned root');
       const repoDir = fixtureSourceRepoDir();
       await fse.outputFile(path.join(repoDir, 'skills', name, 'SKILL.md'), '# Nested source');
       await fse.outputFile(path.join(repoDir, 'skills', name, 'run.sh'), '# Overwrite team script');
@@ -308,7 +309,10 @@ describe('source', () => {
       });
       await pullSources(localConfig, { force: true });
       expect(await fse.readFile(target, 'utf8')).toBe('# Preserve team script');
-      expect((await fse.readJson(getSourceManifestPath('platform', localConfig))).installedSkills).toEqual([]);
+      expect((await fse.readJson(getSourceManifestPath('platform', localConfig))).installedSkills).toEqual([name]);
+      expect(await getAllSourceSkillNames(localConfig)).toContain(name);
+      const { getHandler } = await import('../resources/index.js');
+      expect((await getHandler('skills').scanLocalForPush(teamConfig, localConfig)).some((item) => item.name === owner)).toBe(false);
     });
 
     it('retains canonical nested skill identity through deployment and withdrawal', async () => {

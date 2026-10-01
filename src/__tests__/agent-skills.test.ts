@@ -175,6 +175,21 @@ describe('classifySkill', () => {
     expect(formatSkillSource(cls)).toBe('[source:partner]');
   });
 
+  it.each(['malformed', 'unreadable'])('warns when source provenance cannot be determined: %s', async (failure) => {
+    const { log } = await import('../utils/logger.js');
+    vi.mocked(log.warn).mockClear();
+    await fse.outputJson(getSourceManifestPath('partner', fx.localConfig), {
+      lastPull: '2026-01-01T00:00:00Z', installedSkills: ['external-skill'],
+    });
+    const broken = getSourceManifestPath('broken', fx.localConfig);
+    if (failure === 'unreadable') await fse.ensureDir(broken);
+    else await fse.outputFile(broken, '{truncated');
+    await buildClassifyContext(fx.localConfig);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Source provenance could not be determined:'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(broken));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('do not treat local-only as proof of local ownership'));
+  });
+
   it('keeps a local skill local when only another project or a legacy manifest lists it', async () => {
     const otherConfig: LocalConfig = { ...fx.localConfig, scope: 'project', projectRoot: path.join(fx.tmpDir, 'other-project') };
     await fse.outputJson(getSourceManifestPath('partner', otherConfig), {

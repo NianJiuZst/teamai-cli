@@ -4,6 +4,7 @@ import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
 import { isCliOwnedSkillName } from './builtin-skills.js';
 import type { LocalConfig, TeamaiConfig } from './types.js';
 import { parseFrontmatter } from './utils/frontmatter.js';
+import { log } from './utils/logger.js';
 
 // ─── Local agent skill scanning ─────────────────────────
 //
@@ -54,8 +55,8 @@ export async function buildClassifyContext(localConfig: LocalConfig): Promise<Cl
   try {
     const { getSourceSkillOrigins } = await import('./source.js');
     sourceSkills = await getSourceSkillOrigins(localConfig);
-  } catch {
-    // ignore — running outside a normal HOME env
+  } catch (error) {
+    log.warn(`Source provenance could not be determined: ${(error as Error).message}. Source labels may be incomplete; do not treat local-only as proof of local ownership.`);
   }
 
   return { teamSkills, sourceSkills };

@@ -315,12 +315,16 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
   // Validate every ownership record and deletion target before changing YAML.
   // The shared lifecycle lock keeps source ownership stable through removal.
   const cleanupPaths: string[] = [];
+  const retainedSkills: string[] = [];
   if (manifest) {
     const baseDir = resolveBaseDir(localConfig);
     const otherOwners = await getSourcePathOwners(getSourceManifestPath(name, localConfig));
     const localTeamSkills = await getLocalTeamSkillNames(teamConfig, localConfig);
     for (const skill of manifest.installedSkills) {
-      if (isLocalTeamSkill(skill, localTeamSkills)) continue;
+      if (isLocalTeamSkill(skill, localTeamSkills)) {
+        retainedSkills.push(skill);
+        continue;
+      }
       cleanupPaths.push(...await getSkillRemovalPaths(skill, teamConfig, localConfig, baseDir, otherOwners, manifest.installedPaths?.[skill]));
     }
   }
@@ -347,8 +351,18 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
   // Apply the ownership-checked plan only after configuration was readable.
   for (const target of cleanupPaths) await remove(target);
 
-  // Other projects may still use this source's shared clone and manifests.
-  await remove(getSourceManifestPath(name, localConfig));
+  // Protected files must not lose their provenance and become push candidates.
+  if (manifest && retainedSkills.length > 0) {
+    const retainedPaths = manifest.installedPaths && Object.fromEntries(
+      retainedSkills.filter((skill) => manifest.installedPaths?.[skill] !== undefined)
+        .map((skill) => [skill, manifest.installedPaths![skill]]),
+    );
+    await saveSourceManifest(name, localConfig, { ...manifest, installedSkills: retainedSkills, installedPaths: retainedPaths });
+    log.warn(`Retained source ownership for ${retainedSkills.length} skill(s) overlapping team or builtin content. Review ${getSourceManifestPath(name, localConfig)} before retiring that tracking.`);
+  } else {
+    // Other projects may still use this source's shared clone and manifests.
+    await remove(getSourceManifestPath(name, localConfig));
+  }
 
   log.success(`Removed source "${name}"`);
   if (removeSubscription) log.info('Run `teamai push` to share this change with your team.');
@@ -598,8 +612,20 @@ async function pullSingleSource(
 
   // Deploy skills to tool paths
   const deployed: string[] = [];
-  const retained = new Set<string>();
+  const protectedOldSkills = [...oldInstalled].filter((skill) => isLocalTeamSkill(skill, localTeamSkills));
+  if (repositoryChanged && protectedOldSkills.length > 0) {
+    log.warn(`[source:${source.name}] Cannot replace this installation while prior source paths overlap team or builtin content. Keeping its provenance for manual review: ${getSourceManifestPath(source.name, localConfig)}`);
+    return;
+  }
+  const retained = new Set(protectedOldSkills);
   const installedPaths: Record<string, string[]> = {};
+  for (const skill of protectedOldSkills) {
+    const previousPaths = oldManifest?.installedPaths?.[skill];
+    if (previousPaths) installedPaths[skill] = previousPaths;
+  }
+  if (protectedOldSkills.length > 0) {
+    log.warn(`[source:${source.name}] Keeping source provenance for paths overlapping team or builtin content; review ${getSourceManifestPath(source.name, localConfig)} before retiring that tracking.`);
+  }
   let newCount = 0;
   let updatedCount = 0;
 

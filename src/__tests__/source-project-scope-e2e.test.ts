@@ -306,7 +306,10 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(removeResult.output).toContain('Removed source "beta-source"');
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
       for (const script of protectedScripts) expect(fs.readFileSync(script, 'utf8')).toBe('# Preserve team/builtin script\n');
-      expect(fs.existsSync(manifestPath)).toBe(false);
+      expect(removeResult.output).toContain('Retained source ownership');
+      const retainedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      expect(retainedManifest.installedSkills).toEqual(['team-root/scripts', 'teamai/scripts']);
+      expect(retainedManifest.installedPaths).not.toHaveProperty('external-beta-skill');
       expect(fs.existsSync(sourceLock)).toBe(false);
       expect(fs.existsSync(path.join(home, '.teamai', 'source-repos', repoId, 'repo'))).toBe(true);
       expect(
