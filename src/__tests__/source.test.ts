@@ -149,7 +149,7 @@ describe('source', () => {
       },
     );
 
-    it.each(['', '.', '..', '../outside', '/absolute', 'C:\\absolute', '..\\outside', 'nested/../..'])(
+    it.each(['', '.', '..', '../outside', '/absolute', 'C:\\absolute', '..\\outside', 'nested/../..', 'group/../skill', './skill', 'group//skill', 'skill/', 'group\\skill'])(
       'rejects unsafe fallback skill names: %j', async (unsafeName) => {
         await fse.outputJson(getSourceManifestPath('invalid', localConfig), {
           lastPull: new Date(0).toISOString(), installedSkills: [unsafeName],
@@ -269,6 +269,68 @@ describe('source', () => {
       expect(await fse.pathExists(getSourceManifestPath('platform', localConfig))).toBe(false);
       expect(await fse.readFile(sentinel, 'utf8')).toBe('# Preserve draft');
       expect(await fse.pathExists(path.join(homeDir, '.claude/skills/SKILL.md'))).toBe(false);
+    });
+
+    it.each(['group/../team-skill', './team-skill', 'group//../team-skill', 'team-skill/', 'group\\..\\team-skill'])(
+      'rejects noncanonical public names without bypassing team priority: %s', async (name) => {
+        const repo = 'https://source.test/platform/repo.git';
+        teamConfig.sources = [{ name: 'platform', repo }];
+        const YAML = (await import('yaml')).default;
+        await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+        await fse.outputFile(path.join(localConfig.repo.localPath, 'skills/team-skill/SKILL.md'), '# Team owned');
+        const target = path.join(homeDir, '.claude/skills/team-skill/SKILL.md');
+        await fse.outputFile(target, '# Team owned');
+        const repoDir = fixtureSourceRepoDir();
+        await fse.outputFile(path.join(repoDir, 'skills/team-skill/SKILL.md'), '# Source overwrite');
+        await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo, publicSkills: [name] }));
+        await pullSources(localConfig, { force: true });
+        expect(await fse.readFile(target, 'utf8')).toBe('# Team owned');
+        expect(await fse.pathExists(getSourceManifestPath('platform', localConfig))).toBe(false);
+      },
+    );
+
+    it.each(['team-skill', 'teamai'])('protects local-team and builtin skill roots from nested source names: %s', async (owner) => {
+      const repo = 'https://source.test/platform/repo.git';
+      const name = `${owner}/scripts`;
+      teamConfig.sources = [{ name: 'platform', repo }];
+      const YAML = (await import('yaml')).default;
+      await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+      await fse.outputFile(path.join(localConfig.repo.localPath, 'skills/team-skill/SKILL.md'), '# Team owned');
+      const target = path.join(homeDir, '.claude/skills', name, 'run.sh');
+      await fse.outputFile(target, '# Preserve team script');
+      const repoDir = fixtureSourceRepoDir();
+      await fse.outputFile(path.join(repoDir, 'skills', name, 'SKILL.md'), '# Nested source');
+      await fse.outputFile(path.join(repoDir, 'skills', name, 'run.sh'), '# Overwrite team script');
+      await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo, publicSkills: [name] }));
+      await fse.outputJson(getSourceManifestPath('platform', localConfig), {
+        repositoryId: createHash('sha256').update(repo).digest('hex'), lastPull: new Date(0).toISOString(),
+        installedSkills: [name], installedPaths: { [name]: [`.claude/skills/${name}`] },
+      });
+      await pullSources(localConfig, { force: true });
+      expect(await fse.readFile(target, 'utf8')).toBe('# Preserve team script');
+      expect((await fse.readJson(getSourceManifestPath('platform', localConfig))).installedSkills).toEqual([]);
+    });
+
+    it('retains canonical nested skill identity through deployment and withdrawal', async () => {
+      const repo = 'https://source.test/platform/repo.git';
+      teamConfig.sources = [{ name: 'platform', repo }];
+      const YAML = (await import('yaml')).default;
+      await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+      await fse.outputFile(path.join(localConfig.repo.localPath, 'skills/team-skill/SKILL.md'), '# Team owned');
+      const teamTarget = path.join(homeDir, '.claude/skills/team-skill/SKILL.md');
+      await fse.outputFile(teamTarget, '# Team owned');
+      const repoDir = fixtureSourceRepoDir();
+      await fse.outputFile(path.join(repoDir, 'skills/group/team-skill/SKILL.md'), '# Nested source');
+      await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo, publicSkills: ['group/team-skill'] }));
+      await pullSources(localConfig, { force: true });
+      const nestedTarget = path.join(homeDir, '.claude/skills/group/team-skill/SKILL.md');
+      expect(await fse.readFile(nestedTarget, 'utf8')).toBe('# Nested source');
+      expect(await fse.readFile(teamTarget, 'utf8')).toBe('# Team owned');
+      expect((await fse.readJson(getSourceManifestPath('platform', localConfig))).installedSkills).toEqual(['group/team-skill']);
+      await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo, publicSkills: [] }));
+      await pullSources(localConfig, { force: true });
+      expect(await fse.pathExists(nestedTarget)).toBe(false);
+      expect(await fse.readFile(teamTarget, 'utf8')).toBe('# Team owned');
     });
 
     it('shares the pull TTL and revision across aliases of the same repository', async () => {

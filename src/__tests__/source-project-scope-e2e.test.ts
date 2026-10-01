@@ -252,6 +252,50 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       }
       fs.writeFileSync(manifestPath, manifestBytes);
 
+      // Foreign ownership is part of the removal preflight, before editing YAML.
+      const invalidPeer = path.join(path.dirname(manifestPath), 'invalid-peer.json');
+      for (const peerBytes of ['{truncated', JSON.stringify({ installedSkills: 42 })]) {
+        fs.writeFileSync(invalidPeer, peerBytes);
+        const blocked = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
+        expect(blocked.code, blocked.output).not.toBe(0);
+        expect(blocked.output).toContain('source ownership record');
+        expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+        expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
+        expect(fs.readFileSync(invalidPeer, 'utf8')).toBe(peerBytes);
+        expect(fs.existsSync(path.join(projectRoot, '.claude/skills/external-beta-skill/SKILL.md'))).toBe(true);
+        expect(fs.existsSync(sourceLock)).toBe(false);
+      }
+      fs.rmSync(invalidPeer);
+      const rootLink = path.join(projectRoot, '.source-root-link');
+      fs.symlinkSync(projectRoot, rootLink, 'dir');
+      fs.writeFileSync(manifestPath, JSON.stringify({ ...savedManifest, installedPaths: { 'external-beta-skill': ['.source-root-link'] } }));
+      const blockedRoot = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
+      expect(blockedRoot.code, blockedRoot.output).not.toBe(0);
+      expect(blockedRoot.output).toContain('Refusing to remove a source destination root');
+      expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+      expect(fs.existsSync(rootLink)).toBe(true);
+      expect(fs.existsSync(sourceLock)).toBe(false);
+      fs.unlinkSync(rootLink);
+      fs.writeFileSync(manifestPath, manifestBytes);
+
+      // A prior source claim cannot delete a directory now owned by the team
+      // or a builtin, even when the old source used a canonical nested name.
+      const protectedScripts: string[] = [];
+      const removalManifest = JSON.parse(manifestBytes);
+      fs.mkdirSync(path.join(teamRepo, 'skills/team-root'), { recursive: true });
+      fs.writeFileSync(path.join(teamRepo, 'skills/team-root/SKILL.md'), '# Team-owned skill\n');
+      for (const owner of ['team-root', 'teamai']) {
+        const name = `${owner}/scripts`;
+        const relativePath = `.claude/skills/${name}`;
+        const script = path.join(projectRoot, relativePath, 'run.sh');
+        fs.mkdirSync(path.dirname(script), { recursive: true });
+        fs.writeFileSync(script, '# Preserve team/builtin script\n');
+        protectedScripts.push(script);
+        removalManifest.installedSkills.push(name);
+        removalManifest.installedPaths[name] = [relativePath];
+      }
+      fs.writeFileSync(manifestPath, JSON.stringify(removalManifest));
+
       const removeResult = await runCLI(
         ['source', 'remove', 'beta-source'],
         projectRoot,
@@ -261,6 +305,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(removeResult.code, removeResult.output).toBe(0);
       expect(removeResult.output).toContain('Removed source "beta-source"');
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
+      for (const script of protectedScripts) expect(fs.readFileSync(script, 'utf8')).toBe('# Preserve team/builtin script\n');
       expect(fs.existsSync(manifestPath)).toBe(false);
       expect(fs.existsSync(sourceLock)).toBe(false);
       expect(fs.existsSync(path.join(home, '.teamai', 'source-repos', repoId, 'repo'))).toBe(true);
