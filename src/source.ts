@@ -212,7 +212,9 @@ export async function sourceRemove(name: string, options: GlobalOptions): Promis
 
   const existing = teamConfig.sources ?? [];
   const source = existing.find((s) => s.name === name);
-  if (!source) {
+  // A different destination may already have removed this source from the
+  // shared team checkout. Its absence must not strand this installation.
+  if (!source && !await loadSourceManifest(name, localConfig)) {
     log.error(`Source "${name}" not found. Run \`teamai source list\` to see configured sources.`);
     return;
   }
@@ -222,17 +224,19 @@ export async function sourceRemove(name: string, options: GlobalOptions): Promis
     return;
   }
 
-  // Update teamai.yaml
-  const yamlPath = path.join(repoPath, 'teamai.yaml');
-  const content = await readFileSafe(yamlPath);
-  if (!content) {
-    log.error('Could not read teamai.yaml');
-    return;
-  }
+  if (source) {
+    // Update teamai.yaml
+    const yamlPath = path.join(repoPath, 'teamai.yaml');
+    const content = await readFileSafe(yamlPath);
+    if (!content) {
+      log.error('Could not read teamai.yaml');
+      return;
+    }
 
-  const raw = YAML.parse(content);
-  raw.sources = (raw.sources ?? []).filter((s: SourceConfig) => s.name !== name);
-  await fse.writeFile(yamlPath, YAML.stringify(raw));
+    const raw = YAML.parse(content);
+    raw.sources = (raw.sources ?? []).filter((s: SourceConfig) => s.name !== name);
+    await fse.writeFile(yamlPath, YAML.stringify(raw));
+  }
 
   // Clean up deployed source skills from tool paths
   await cleanupSourceSkills(name, teamConfig, localConfig);
@@ -241,7 +245,7 @@ export async function sourceRemove(name: string, options: GlobalOptions): Promis
   await remove(getSourceManifestPath(name, localConfig));
 
   log.success(`Removed source "${name}"`);
-  log.info('Run `teamai push` to share this change with your team.');
+  if (source) log.info('Run `teamai push` to share this change with your team.');
 }
 
 /**

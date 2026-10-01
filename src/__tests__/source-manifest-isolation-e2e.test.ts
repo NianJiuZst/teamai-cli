@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,7 +13,7 @@ const GIT_ENV = {
   GIT_COMMITTER_NAME: 'TeamAI CI', GIT_COMMITTER_EMAIL: 'ci@teamai.test',
 };
 
-it('keeps source installation ownership separate for projects sharing one source', () => {
+it.each([false, true])('keeps installation ownership separate (shared team checkout: %s)', (sharedCheckout) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-manifest-')));
   const home = path.join(root, 'home');
   fs.mkdirSync(home);
@@ -48,30 +49,37 @@ it('keeps source installation ownership separate for projects sharing one source
     git(['clone', '-q', '--bare', sourceSeed, sourceRemote], root);
     git(['config', '--file', path.join(home, '.gitconfig'), `url.file://${sourceRemote}.insteadOf`, sourceUrl], root);
     const projects: string[] = [];
+    const manifests: string[] = [];
     for (const name of ['alpha', 'beta']) {
       const project = path.join(root, name);
-      const teamRepo = path.join(project, '.teamai', 'team-repo');
-      const teamRemote = path.join(root, `${name}-team.git`);
+      const teamRepo = sharedCheckout ? path.join(root, 'shared-team-repo') : path.join(project, '.teamai', 'team-repo');
+      const teamRemote = path.join(root, `${sharedCheckout ? 'shared' : name}-team.git`);
+      const seedTeam = !fs.existsSync(teamRepo);
       fs.mkdirSync(teamRepo, { recursive: true });
+      fs.mkdirSync(path.join(project, '.teamai'), { recursive: true });
       fs.mkdirSync(path.join(project, '.claude', 'skills'), { recursive: true });
       fs.mkdirSync(path.dirname(skill(project, 'legacy-local')), { recursive: true });
       fs.writeFileSync(skill(project, 'legacy-local'), `# ${name} legacy local draft\n`);
-      fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), YAML.stringify({
-        team: name, repo: teamRemote, provider: 'git', reviewers: [],
-        sources: [{ name: 'shared', repo: sourceUrl }],
-        toolPaths: { claude: { skills: '.claude/skills' } },
-      }));
-      git(['init', '-q', '-b', 'main'], teamRepo);
-      git(['add', '-A'], teamRepo);
-      git(['commit', '-q', '-m', 'seed team'], teamRepo);
-      git(['clone', '-q', '--bare', teamRepo, teamRemote], root);
-      git(['remote', 'add', 'origin', teamRemote], teamRepo);
-      git(['push', '-q', '--set-upstream', 'origin', 'main'], teamRepo);
+      if (seedTeam) {
+        fs.writeFileSync(path.join(teamRepo, 'teamai.yaml'), YAML.stringify({
+          team: name, repo: teamRemote, provider: 'git', reviewers: [],
+          sources: [{ name: 'shared', repo: sourceUrl }],
+          toolPaths: { claude: { skills: '.claude/skills' } },
+        }));
+        git(['init', '-q', '-b', 'main'], teamRepo);
+        git(['add', '-A'], teamRepo);
+        git(['commit', '-q', '-m', 'seed team'], teamRepo);
+        git(['clone', '-q', '--bare', teamRepo, teamRemote], root);
+        git(['remote', 'add', 'origin', teamRemote], teamRepo);
+        git(['push', '-q', '--set-upstream', 'origin', 'main'], teamRepo);
+      }
       fs.writeFileSync(path.join(project, '.teamai', 'config.yaml'), YAML.stringify({
         repo: { localPath: teamRepo, remote: teamRemote }, username: 'tester',
         updatePolicy: 'auto', scope: 'project', projectRoot: project,
       }));
       projects.push(project);
+      const installationId = createHash('sha256').update(JSON.stringify([project, teamRepo])).digest('hex');
+      manifests.push(path.join(home, '.teamai', 'sources', 'shared', 'installations', `${installationId}.json`));
     }
     run(['pull', '--force'], projects[0]);
     expect(fs.readFileSync(skill(projects[0], 'old-skill'), 'utf8')).toBe('# Source old-skill\n');
@@ -91,13 +99,32 @@ it('keeps source installation ownership separate for projects sharing one source
     expect(fs.readFileSync(skill(projects[1], 'new-skill'), 'utf8')).toBe('# Source new-skill\n');
     fs.mkdirSync(path.dirname(skill(projects[0], 'new-skill')), { recursive: true });
     fs.writeFileSync(skill(projects[0], 'new-skill'), '# Alpha local draft\n');
+    const betaManifest = fs.readFileSync(manifests[1], 'utf8');
     run(['source', 'remove', 'shared'], projects[0]);
+    expect(fs.existsSync(manifests[0])).toBe(false);
+    expect(fs.readFileSync(manifests[1], 'utf8')).toBe(betaManifest);
     expect(fs.existsSync(skill(projects[0], 'old-skill'))).toBe(false);
     expect(fs.readFileSync(skill(projects[0], 'new-skill'), 'utf8')).toBe('# Alpha local draft\n');
     expect(fs.readFileSync(skill(projects[1], 'new-skill'), 'utf8')).toBe('# Source new-skill\n');
-    run(['source', 'remove', 'shared'], projects[1]);
+    const betaConfig = YAML.parse(fs.readFileSync(path.join(projects[1], '.teamai', 'config.yaml'), 'utf8'));
+    const betaTeamYaml = path.join(betaConfig.repo.localPath, 'teamai.yaml');
+    if (sharedCheckout) fs.appendFileSync(betaTeamYaml, '# Preserve this shared configuration comment.\n');
+    const beforeBetaRemoval = fs.readFileSync(betaTeamYaml, 'utf8');
+    if (sharedCheckout) expect(YAML.parse(beforeBetaRemoval).sources).toEqual([]);
+    expect(run(['source', 'remove', 'shared', '--dry-run'], projects[1])).toContain('[dry-run] Would remove source "shared"');
+    expect(fs.readFileSync(skill(projects[1], 'new-skill'), 'utf8')).toBe('# Source new-skill\n');
+    expect(fs.readFileSync(betaTeamYaml, 'utf8')).toBe(beforeBetaRemoval);
+    expect(fs.readFileSync(manifests[1], 'utf8')).toBe(betaManifest);
+    const removeOutput = run(['source', 'remove', 'shared'], projects[1]);
+    expect(removeOutput).toContain('Removed source "shared"');
+    if (sharedCheckout) expect(removeOutput).not.toContain('Run `teamai push`');
+    expect(fs.existsSync(manifests[1])).toBe(false);
+    if (sharedCheckout) expect(fs.readFileSync(betaTeamYaml, 'utf8')).toBe(beforeBetaRemoval);
     expect(fs.existsSync(skill(projects[1], 'new-skill'))).toBe(false);
     expect(fs.readFileSync(skill(projects[1], 'old-skill'), 'utf8')).toBe('# Beta local draft\n');
+    expect(fs.readFileSync(legacyPath, 'utf8')).toBe(legacyManifest);
+    expect(run(['source', 'remove', 'shared'], projects[1])).toContain('Source "shared" not found.');
+    expect(fs.readFileSync(skill(projects[1], 'legacy-local'), 'utf8')).toBe('# beta legacy local draft\n');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
