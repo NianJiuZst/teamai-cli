@@ -78,6 +78,15 @@ export function getSourceManifestPath(sourceName: string, localConfig: LocalConf
   return path.join(getSourceDir(sourceName), 'installations', `${installationId}.json`);
 }
 
+/** Portable lexical check: a tracking record can never authorize its root. */
+function isRelativeDescendant(value: string): boolean {
+  const portable = value.replaceAll('\\', '/');
+  const normalized = path.posix.normalize(portable).replace(/\/+$/, '');
+  return value.length > 0 && !value.includes('\0') && !path.posix.isAbsolute(portable)
+    && !path.win32.isAbsolute(value) && !/^[a-z]:/i.test(value)
+    && normalized !== '.' && normalized !== '..' && !normalized.startsWith('../');
+}
+
 async function readSourceManifest(manifestPath: string): Promise<SourceInstallManifest | null> {
   let raw: string;
   try {
@@ -96,9 +105,9 @@ async function readSourceManifest(manifestPath: string): Promise<SourceInstallMa
     throw new Error(`Invalid source ownership record: ${manifestPath}`);
   }
   const manifest = value as SourceInstallManifest;
-  if (!Array.isArray(manifest.installedSkills) || !manifest.installedSkills.every((skill) => typeof skill === 'string')
+  if (!Array.isArray(manifest.installedSkills) || !manifest.installedSkills.every((skill) => typeof skill === 'string' && isRelativeDescendant(skill))
     || (manifest.installedPaths !== undefined && (!manifest.installedPaths || typeof manifest.installedPaths !== 'object'
-      || Array.isArray(manifest.installedPaths) || !Object.values(manifest.installedPaths).every((paths) => Array.isArray(paths) && paths.every((target) => typeof target === 'string'))))
+      || Array.isArray(manifest.installedPaths) || !Object.values(manifest.installedPaths).every((paths) => Array.isArray(paths) && paths.every((target) => typeof target === 'string' && isRelativeDescendant(target)))))
     || (manifest.destinationRoot !== undefined && (typeof manifest.destinationRoot !== 'string' || !path.isAbsolute(manifest.destinationRoot)))
     || (manifest.repositoryId !== undefined && typeof manifest.repositoryId !== 'string')) {
     throw new Error(`Invalid source ownership record: ${manifestPath}`);
@@ -742,6 +751,7 @@ export function deriveSourceName(repoUrl: string): string | null {
  * Returns the full path to the skill directory, or null if not found.
  */
 async function findSkillInRepo(skillsDir: string, skillName: string): Promise<string | null> {
+  if (!isRelativeDescendant(skillName)) throw new Error('Invalid source skill name');
   if (!await pathExists(skillsDir)) return null;
 
   // Check flat layout first: skills/<name>/SKILL.md
@@ -834,13 +844,19 @@ export async function getSourcePathOwners(currentManifest?: string): Promise<Sou
 
 /** Remove recorded paths only after the last installation releases them. */
 async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string, otherOwners: SourcePathOwner[], installedPaths?: string[]): Promise<void> {
+  if (!isRelativeDescendant(skillName)) throw new Error('Invalid source skill name for cleanup');
   const paths = installedPaths ?? Object.values(scopedToolPaths(teamConfig, localConfig))
     .flatMap((toolPath) => toolPath.skills ? [path.join(toolPath.skills, skillName)] : []);
   for (const installedPath of paths) {
     const skillDir = path.resolve(baseDir, installedPath);
     assertWithinRoot(baseDir, skillDir);
+    if (!isRelativeDescendant(path.relative(baseDir, skillDir))) throw new Error('Refusing to remove a source destination root');
     if (!await pathExists(skillDir)) continue;
     const physicalPath = resolveReal(skillDir);
+    const physicalRoot = resolveReal(baseDir);
+    if (physicalPath === physicalRoot || physicalRoot.startsWith(physicalPath + path.sep)) {
+      throw new Error('Refusing to remove a source destination root or ancestor');
+    }
     const owner = otherOwners.find((candidate) => pathsOverlap(candidate.path, physicalPath));
     if (owner) {
       if (owner.manifestPath) log.info(`Kept "${skillDir}" because another source installation owns it. Ownership record: ${owner.manifestPath}`);

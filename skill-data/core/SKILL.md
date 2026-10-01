@@ -125,6 +125,8 @@ Git source add, browse/cache refresh, pull, and removal use the same machine-loc
 
 A successful source pull records only its current destinations and releases obsolete tool paths, including when the repository URL is unchanged. A valid source config with no `publicSkills`, an empty list, or no remaining published skill directories releases the previous installation. Files still owned by another installation remain protected; a missing or unreadable source config leaves the old installation untouched. Conflict-retained copies keep their previous records.
 
+Ownership records must contain safe relative skill names and non-empty relative descendant paths; root-equivalent, escaping, and absolute paths stop cleanup before configuration or files are changed.
+
 Do not run source installation/removal and push concurrently. The source mutex serializes source mutations, but push does not retain it through its entire staging/publication transaction; full cross-command snapshot isolation remains a limitation.
 
 Every other command, every flag, and the flags `--help` hides live in the

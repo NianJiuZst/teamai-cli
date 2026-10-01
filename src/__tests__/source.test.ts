@@ -137,6 +137,27 @@ describe('source', () => {
       expect(await getHandler('skills').scanLocalForPush(teamConfig, localConfig)).toEqual([]);
     });
 
+    it.each(['', '.', './', 'nested/..', '..', '../outside', '/absolute', 'C:\\absolute', 'C:relative', '..\\outside', 'nested/../..', 'bad\0path'])(
+      'rejects unsafe recorded deletion paths: %j', async (unsafePath) => {
+        await fse.outputJson(getSourceManifestPath('invalid', localConfig), {
+          lastPull: new Date(0).toISOString(), installedSkills: ['skill'], installedPaths: { skill: [unsafePath] },
+        });
+        await expect(getSourceSkillOrigins(localConfig)).rejects.toThrow('Invalid source ownership record');
+        await fse.outputFile(path.join(homeDir, '.claude/skills/local-draft/SKILL.md'), '# Preserve');
+        const { getHandler } = await import('../resources/index.js');
+        expect(await getHandler('skills').scanLocalForPush(teamConfig, localConfig)).toEqual([]);
+      },
+    );
+
+    it.each(['', '.', '..', '../outside', '/absolute', 'C:\\absolute', '..\\outside', 'nested/../..'])(
+      'rejects unsafe fallback skill names: %j', async (unsafeName) => {
+        await fse.outputJson(getSourceManifestPath('invalid', localConfig), {
+          lastPull: new Date(0).toISOString(), installedSkills: [unsafeName],
+        });
+        await expect(getSourceSkillOrigins(localConfig)).rejects.toThrow('Invalid source ownership record');
+      },
+    );
+
     it.each(['codex-shared', 'nested'])('excludes the actual scanned source path even when future destination differs: %s', async (layout) => {
       const tool = layout === 'codex-shared' ? 'codex' : 'claude';
       const toolDir = layout === 'codex-shared' ? '.codex/skills' : '.claude/skills';
@@ -232,6 +253,22 @@ describe('source', () => {
       }
       expect(pullRepo).toHaveBeenCalledTimes(2);
       expect(await fse.pathExists(path.join(sourcesDir, 'shared', 'installed.json'))).toBe(false);
+    });
+
+    it.each(['.', '..', '../outside', '/absolute'])('rejects unsafe public skill names before deployment: %s', async (name) => {
+      const repo = 'https://source.test/platform/repo.git';
+      teamConfig.sources = [{ name: 'platform', repo }];
+      const YAML = (await import('yaml')).default;
+      await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+      const repoDir = fixtureSourceRepoDir();
+      await fse.outputFile(path.join(repoDir, 'skills/SKILL.md'), '# Not a named skill');
+      await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo, publicSkills: [name] }));
+      const sentinel = path.join(homeDir, '.claude/skills/local-draft/SKILL.md');
+      await fse.outputFile(sentinel, '# Preserve draft');
+      await pullSources(localConfig, { force: true });
+      expect(await fse.pathExists(getSourceManifestPath('platform', localConfig))).toBe(false);
+      expect(await fse.readFile(sentinel, 'utf8')).toBe('# Preserve draft');
+      expect(await fse.pathExists(path.join(homeDir, '.claude/skills/SKILL.md'))).toBe(false);
     });
 
     it('shares the pull TTL and revision across aliases of the same repository', async () => {

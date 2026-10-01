@@ -230,6 +230,28 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
       expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
 
+      const savedManifest = JSON.parse(manifestBytes);
+      const unsafeManifests = [
+        ...['', '.', 'nested/..', '../outside', projectRoot].map((unsafePath) => ({
+          ...savedManifest, installedPaths: { 'external-beta-skill': [unsafePath] },
+        })),
+        ...['..', '../..', '/absolute'].map((unsafeName) => ({
+          ...savedManifest, installedSkills: [unsafeName], installedPaths: undefined,
+        })),
+      ];
+      for (const unsafeManifest of unsafeManifests) {
+        const invalidBytes = JSON.stringify(unsafeManifest);
+        fs.writeFileSync(manifestPath, invalidBytes);
+        const blocked = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
+        expect(blocked.code, blocked.output).not.toBe(0);
+        expect(blocked.output).toContain('Invalid source ownership record');
+        expect(fs.existsSync(sourceLock)).toBe(false);
+        expect(fs.readFileSync(manifestPath, 'utf8')).toBe(invalidBytes);
+        expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+        expect(fs.existsSync(path.join(projectRoot, '.claude/skills/external-beta-skill/SKILL.md'))).toBe(true);
+      }
+      fs.writeFileSync(manifestPath, manifestBytes);
+
       const removeResult = await runCLI(
         ['source', 'remove', 'beta-source'],
         projectRoot,
