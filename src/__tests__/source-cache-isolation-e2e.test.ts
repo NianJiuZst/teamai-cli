@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -76,9 +77,43 @@ it('keeps same-named source repos separate across teams, including removal and c
     run(['source', 'remove', 'shared'], projects[0]);
     expect(fs.readdirSync(caches)).toHaveLength(2);
     expect(fs.existsSync(legacyRepo)).toBe(true);
+    const betaUrl = 'https://source.test/beta/skills.git';
+    const betaCache = path.join(caches, createHash('sha256').update(betaUrl).digest('hex'));
+    const pullStamp = fs.readFileSync(path.join(betaCache, 'last-pull.json'), 'utf8');
     fs.renameSync(sourceRemotes[1], `${sourceRemotes[1]}.offline`);
     expect(run(['pull', '--force'], projects[1])).toContain('[source:shared] Pull failed:');
     expect(fs.readFileSync(path.join(projects[1], '.claude', 'skills', 'shared-skill', 'SKILL.md'), 'utf8')).toBe('# beta source\n');
+    expect(fs.readFileSync(path.join(betaCache, 'last-pull.json'), 'utf8')).toBe(pullStamp);
+
+    // Re-add the same alias with a different URL while its old clone remains.
+    // The other team's URL-specific cache is usable even while that remote is offline.
+    const manifests = path.join(home, '.teamai', 'sources', 'shared', 'installations');
+    const [betaManifestName] = fs.readdirSync(manifests);
+    const betaManifestPath = path.join(manifests, betaManifestName);
+    const betaManifest = fs.readFileSync(betaManifestPath, 'utf8');
+    expect(run(['source', 'add', betaUrl, '--name', 'shared'], projects[0])).toContain('Added source "shared"');
+    expect(run(['source', 'list'], projects[0])).toContain(betaUrl);
+    expect(run(['source', 'browse', 'shared'], projects[0])).toContain('shared-skill');
+    run(['pull', '--force'], projects[0]);
+    expect(fs.readFileSync(path.join(projects[0], '.claude', 'skills', 'shared-skill', 'SKILL.md'), 'utf8')).toBe('# beta source\n');
+    expect(fs.readFileSync(betaManifestPath, 'utf8')).toBe(betaManifest);
+    expect(fs.readdirSync(manifests)).toHaveLength(2);
+
+    // Both projects now share a URL. Removing one must retain the shared clone,
+    // its successful-pull timestamp, and the other installation's ownership record.
+    run(['source', 'remove', 'shared'], projects[0]);
+    expect(fs.existsSync(path.join(projects[0], '.claude', 'skills', 'shared-skill'))).toBe(false);
+    expect(fs.readFileSync(betaManifestPath, 'utf8')).toBe(betaManifest);
+    expect(fs.readdirSync(manifests)).toEqual([betaManifestName]);
+    expect(fs.existsSync(path.join(betaCache, 'repo'))).toBe(true);
+    expect(fs.readFileSync(path.join(projects[1], '.claude', 'skills', 'shared-skill', 'SKILL.md'), 'utf8')).toBe('# beta source\n');
+    expect(run(['pull', '--force'], projects[1])).toContain('[source:shared] Pull failed:');
+    expect(fs.readFileSync(path.join(projects[1], '.claude', 'skills', 'shared-skill', 'SKILL.md'), 'utf8')).toBe('# beta source\n');
+    expect(fs.readFileSync(path.join(betaCache, 'last-pull.json'), 'utf8')).toBe(pullStamp);
+    run(['source', 'remove', 'shared'], projects[1]);
+    expect(fs.existsSync(path.join(projects[1], '.claude', 'skills', 'shared-skill'))).toBe(false);
+    expect(fs.readdirSync(manifests)).toEqual([]);
+    expect(fs.readFileSync(path.join(legacyRepo, 'skills', 'shared-skill', 'SKILL.md'), 'utf8')).toBe('# Unverified legacy copy\n');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
