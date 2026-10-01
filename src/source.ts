@@ -133,8 +133,18 @@ async function recordSourcePull(source: SourceConfig): Promise<void> {
 /**
  * Clone or pull a source repo. Returns the repo path, or null on failure.
  */
-async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<string | null> {
+async function ensureSourceRepo(source: SourceConfig, force: boolean, dryRun = false): Promise<string | null> {
   const repoDir = getSourceRepoDir(source);
+  if (dryRun) {
+    if (!await pathExists(repoDir)) {
+      log.info(`[dry-run] [source:${source.name}] Would clone the repository; no cached skills are available to preview.`);
+      return null;
+    }
+    if (force || await shouldPullSource(source)) {
+      log.info(`[dry-run] [source:${source.name}] Would refresh the cached repository; previewing its current contents.`);
+    }
+    return repoDir;
+  }
 
   if (await pathExists(repoDir)) {
     // Existing clone: pull if TTL expired or forced
@@ -217,6 +227,11 @@ async function sourceAddLocked(repoUrl: string, options: { name?: string } & Glo
     return;
   }
 
+  if (options.dryRun) {
+    log.info(`[dry-run] Would add source "${name}" (${repoUrl}); repository access will be checked when applied.`);
+    return;
+  }
+
   // Verify the source repo is accessible by cloning it
   const cloneResult = await ensureSourceRepo({ name, repo: repoUrl }, true);
   if (!cloneResult) {
@@ -231,11 +246,6 @@ async function sourceAddLocked(repoUrl: string, options: { name?: string } & Glo
   const sourceConfig = await loadTeamConfig(cloneResult);
   for (const line of sourceSyncWarnings(name, sourceConfig)) {
     log.warn(line);
-  }
-
-  if (options.dryRun) {
-    log.info(`[dry-run] Would add source "${name}" (${repoUrl})`);
-    return;
   }
 
   // Update teamai.yaml
@@ -412,6 +422,10 @@ export async function sourceRemoveHttp(options: GlobalOptions): Promise<void> {
 export async function sourceBrowse(name: string, options: GlobalOptions): Promise<void> {
   // Read-only: the load never persists a migration (#893).
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
+  if (!(teamConfig.sources ?? []).some((source) => source.name === name)) {
+    log.error(`Source "${name}" not found. Run \`teamai source list\` to see configured sources.`);
+    return;
+  }
   await withSourceLock(options, () => sourceBrowseLocked(name, options, localConfig, teamConfig));
 }
 
@@ -426,9 +440,9 @@ async function sourceBrowseLocked(name: string, options: GlobalOptions, localCon
   }
 
   // Ensure source repo is cloned
-  const repoDir = await ensureSourceRepo(source, !!options.force);
+  const repoDir = await ensureSourceRepo(source, !!options.force, !!options.dryRun);
   if (!repoDir) {
-    log.error(`Could not access source "${name}".`);
+    if (!options.dryRun) log.error(`Could not access source "${name}".`);
     return;
   }
 
@@ -510,7 +524,7 @@ async function pullSingleSource(
   options: GlobalOptions,
 ): Promise<void> {
   // Ensure source repo is cloned/updated
-  const repoDir = await ensureSourceRepo(source, !!options.force);
+  const repoDir = await ensureSourceRepo(source, !!options.force, !!options.dryRun);
   if (!repoDir) return;
 
   // Load source's teamai.yaml

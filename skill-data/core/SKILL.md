@@ -121,7 +121,9 @@ Pull skips a skill when a different or unidentified repository owns an overlappi
 
 Push quarantines ambiguous legacy names and other installations' skills at the current physical target; unreadable ownership stops skill publication. Legacy records never authorize deletion. Pull active sources, review all old copies, and only then archive legacy tracking manually. This may temporarily hide unrelated same-named drafts. Moved/deleted checkouts do not automatically release ownership: review the record identified in warnings. New records include the checkout/destination; automatic legacy migration and orphan cleanup are not implemented.
 
-Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state. Skill push is also withheld when a source transaction is active.
+Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state and reads existing caches, without cloning, pulling, or updating cache timestamps. Uncached previews report that skill contents cannot yet be inspected. Skill push is also withheld when a source transaction is active.
+
+Do not run source installation/removal and push concurrently. The source mutex serializes source mutations, but push does not retain it through its entire staging/publication transaction; full cross-command snapshot isolation remains a limitation.
 
 Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.

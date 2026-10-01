@@ -38,7 +38,9 @@ Local source tags use scoped provenance. Push also excludes skills whose current
 
 A missing or moved consumer checkout does not prove its deployed files are abandoned. Such records remain protective, and messages identify the owning manifest; new records retain the checkout path for review. Remove an installation from its original scope before moving/deleting its checkout when possible. Existing orphan records and legacy copies require manual review before retiring ownership; automatic orphan garbage collection is not implemented.
 
-Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state. Skill push is also withheld when a source transaction is active.
+Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state and reads existing caches, without cloning, pulling, or updating cache timestamps. Uncached previews report that skill contents cannot yet be inspected. Skill push is also withheld when a source transaction is active.
+
+Do not run source installation/removal and push concurrently. The source mutex serializes source mutations, but push does not retain it through its entire staging/publication transaction; full cross-command snapshot isolation remains a limitation.
 
 ## The two anchors (the core model)
 

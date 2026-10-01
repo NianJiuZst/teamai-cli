@@ -143,6 +143,13 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
         GIT_CONFIG_VALUE_1: 'always',
       };
 
+      const beforeAdd = fs.readFileSync(path.join(teamRepo, 'teamai.yaml'), 'utf8');
+      const addPreview = await runCLI(['source', 'add', sourceUrl, '--name', 'beta-source', '--dry-run'], projectRoot, home, sourceGitEnv);
+      expect(addPreview.code, addPreview.output).toBe(0);
+      expect(addPreview.output).toContain('[dry-run] Would add source "beta-source"');
+      expect(fs.readFileSync(path.join(teamRepo, 'teamai.yaml'), 'utf8')).toBe(beforeAdd);
+      expect(fs.existsSync(path.join(home, '.teamai', 'sources'))).toBe(false);
+
       const addResult = await runCLI(
         ['source', 'add', sourceUrl, '--name', 'beta-source'],
         projectRoot,
@@ -187,6 +194,17 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).installedSkills)
         .toEqual(['external-beta-skill']);
 
+      const repoId = createHash('sha256').update(sourceUrl).digest('hex');
+      const cacheStamp = path.join(home, '.teamai', 'sources', 'beta-source', 'repos', repoId, 'last-pull.json');
+      const expiredStamp = JSON.stringify({ lastPull: new Date(0).toISOString() });
+      fs.writeFileSync(cacheStamp, expiredStamp);
+      for (const args of [['source', 'browse', 'beta-source', '--dry-run'], ['pull', '--force', '--dry-run']]) {
+        const preview = await runCLI(args, projectRoot, home, sourceGitEnv);
+        expect(preview.code, preview.output).toBe(0);
+        expect(preview.output).toContain('Would refresh the cached repository');
+        expect(fs.readFileSync(cacheStamp, 'utf8')).toBe(expiredStamp);
+      }
+
       const manifestBytes = fs.readFileSync(manifestPath, 'utf8');
       const configBytes = fs.readFileSync(teamYamlPath, 'utf8');
       const sourceLock = path.join(home, '.teamai', 'sources', '.lifecycle-lock');
@@ -223,7 +241,6 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
       expect(fs.existsSync(manifestPath)).toBe(false);
       expect(fs.existsSync(sourceLock)).toBe(false);
-      const repoId = createHash('sha256').update(sourceUrl).digest('hex');
       expect(fs.existsSync(path.join(home, '.teamai', 'sources', 'beta-source', 'repos', repoId, 'repo'))).toBe(true);
       expect(
         fs.existsSync(path.join(projectRoot, '.claude', 'skills', 'external-beta-skill')),

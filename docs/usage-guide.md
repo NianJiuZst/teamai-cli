@@ -2457,7 +2457,9 @@ Source tags use the current installation. Push also excludes another installatio
 
 Moving or deleting a team checkout does not automatically abandon its deployed files. Remove sources from their original scope first when possible. New manifests record the consumer checkout and destination, and ownership warnings identify the record to review. Orphan records remain protective until manually reviewed; there is no automatic orphan cleanup. If tracking is unreadable, skill push stops with a warning rather than publishing potentially third-party files.
 
-Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state. Skill push is also withheld when a source transaction is active.
+Git source add, browse/cache refresh, pull, and removal use the same machine-local lifecycle lock, re-reading state under it. A busy operation asks for a retry instead of bypassing another live owner; dry-run only checks lock state and reads existing caches, without cloning, pulling, or updating cache timestamps. Uncached previews report that skill contents cannot yet be inspected. Skill push is also withheld when a source transaction is active.
+
+Do not run source installation/removal and push concurrently. The source mutex serializes source mutations, but push does not retain it through its entire staging/publication transaction; full cross-command snapshot isolation remains a limitation.
 
 A source only shares the skills it opts in via a `publicSkills` list in its own `teamai.yaml`. If the repo has no `teamai.yaml`, or declares no `publicSkills`, `teamai source add` succeeds but warns that the source will sync **0 skills** — the source team has to publish a `publicSkills` list before anything flows through.
 

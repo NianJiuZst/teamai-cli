@@ -271,6 +271,29 @@ describe('source', () => {
       expect(await fse.readFile(manifest, 'utf8')).toBe(goodManifest);
     });
 
+    it('keeps source cache and ownership unchanged during uncached and forced cached previews', async () => {
+      teamConfig.sources = [{ name: 'platform', repo: 'https://source.test/platform/repo.git' }];
+      const YAML = (await import('yaml')).default;
+      const { pullRepo } = await import('../utils/git.js');
+      vi.mocked(pullRepo).mockClear();
+      await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+      await pullSources(localConfig, { dryRun: true, force: true });
+      expect(await fse.pathExists(sourcesDir)).toBe(false);
+      expect(pullRepo).not.toHaveBeenCalled();
+      const repoDir = fixtureSourceRepoDir();
+      await fse.outputFile(path.join(repoDir, 'skills/shared-skill/SKILL.md'), '# Cached source');
+      await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'platform', repo: teamConfig.sources[0].repo, publicSkills: ['shared-skill'] }));
+      const stamp = path.join(path.dirname(repoDir), 'last-pull.json');
+      await fse.outputJson(stamp, { lastPull: new Date(0).toISOString() });
+      const before = await fse.readFile(stamp, 'utf8');
+      await pullSources(localConfig, { dryRun: true, force: true });
+      expect(pullRepo).not.toHaveBeenCalled();
+      expect(await fse.readFile(stamp, 'utf8')).toBe(before);
+      expect(await fse.pathExists(getSourceManifestPath('platform', localConfig))).toBe(false);
+      expect(await fse.pathExists(path.join(homeDir, '.claude/skills/shared-skill'))).toBe(false);
+      expect(await fse.pathExists(path.join(sourcesDir, '.lifecycle-lock'))).toBe(false);
+    });
+
     it('should do nothing when no sources configured', async () => {
       await pullSources(localConfig, {});
       // No errors, no side effects

@@ -103,6 +103,11 @@ it.each([
         const alphaManifest = fs.readFileSync(alpha.manifest, 'utf8');
         const warning = `[source:${beta.alias}] Skipping "old-skill": another source repository owns `;
         expect(fs.existsSync(beta.manifest)).toBe(false);
+        const uncachedPreview = run(['pull', '--force', '--dry-run']);
+        expect(uncachedPreview).toContain('no cached skills are available to preview.');
+        expect(fs.existsSync(path.join(home, '.teamai', 'sources', beta.alias))).toBe(false);
+        expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source old-skill\n');
+        expect(run(['source', 'browse', beta.alias])).toContain('old-skill');
         const preview = run(['pull', '--force', '--dry-run']);
         expect(preview).toContain(warning);
         expect(preview).not.toContain('Would pull old-skill (new)');
