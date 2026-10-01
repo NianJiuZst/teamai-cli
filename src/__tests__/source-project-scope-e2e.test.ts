@@ -207,7 +207,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
 
       const manifestBytes = fs.readFileSync(manifestPath, 'utf8');
       const configBytes = fs.readFileSync(teamYamlPath, 'utf8');
-      const sourceLock = path.join(home, '.teamai', 'sources', '.lifecycle-lock');
+      const sourceLock = path.join(home, '.teamai', '.source-lifecycle-lock');
       const lockBytes = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'e2e-holder' });
       fs.writeFileSync(sourceLock, lockBytes);
       for (const args of [

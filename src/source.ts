@@ -37,7 +37,7 @@ import { resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js'
 // ─── Source repo management ──────────────────────────────
 
 function sourceLockPath(): string {
-  return path.join(getUserHome(), '.teamai', 'sources', '.lifecycle-lock');
+  return path.join(getUserHome(), '.teamai', '.source-lifecycle-lock');
 }
 
 async function withSourceLock(options: GlobalOptions, action: () => Promise<void>): Promise<void> {
@@ -534,12 +534,9 @@ async function pullSingleSource(
     return;
   }
 
-  // Check publicSkills declaration (opt-in: no field = no sharing)
-  const publicSkills = sourceTeamConfig.publicSkills;
-  if (!publicSkills || publicSkills.length === 0) {
-    log.debug(`[source:${source.name}] No publicSkills declared, skipping`);
-    return;
-  }
+  // A valid empty publication withdraws previous skills. An unreadable config
+  // above is not evidence of withdrawal and leaves the installation untouched.
+  const publicSkills = sourceTeamConfig.publicSkills ?? [];
 
   // Find actual skill directories in the source repo
   const skillsDir = path.join(repoDir, 'skills');
@@ -551,8 +548,6 @@ async function pullSingleSource(
       skillsToDeploy.push({ name: skillName, sourcePath: skillPath });
     }
   }
-
-  if (skillsToDeploy.length === 0) return;
 
   // Load current manifest to determine what to add/remove
   const oldManifest = await loadSourceManifest(source.name, localConfig);
@@ -567,7 +562,7 @@ async function pullSingleSource(
   // Deploy skills to tool paths
   const deployed: string[] = [];
   const retained = new Set<string>();
-  const installedPaths: Record<string, string[]> = repositoryChanged ? {} : { ...oldManifest?.installedPaths };
+  const installedPaths: Record<string, string[]> = {};
   let newCount = 0;
   let updatedCount = 0;
 
@@ -595,7 +590,7 @@ async function pullSingleSource(
         conflictingRecord = owner.manifestPath;
       }
     }
-    plans.push({ skill, targets, conflictingPath, conflictingRecord });
+    if (targets.length > 0) plans.push({ skill, targets, conflictingPath, conflictingRecord });
   }
 
   // A repository replacement cannot retain old content under the new identity.
@@ -610,7 +605,11 @@ async function pullSingleSource(
   for (const { skill, targets, conflictingPath, conflictingRecord } of plans) {
     if (conflictingPath) {
       log.warn(`[source:${source.name}] Skipping "${skill.name}": another source repository owns ${conflictingPath}. Remove that installation before pulling this skill. Ownership record: ${conflictingRecord}`);
-      if (oldInstalled.has(skill.name)) retained.add(skill.name);
+      if (oldInstalled.has(skill.name)) {
+        retained.add(skill.name);
+        const previousPaths = oldManifest?.installedPaths?.[skill.name];
+        if (previousPaths) installedPaths[skill.name] = previousPaths;
+      }
       continue;
     }
 
@@ -638,28 +637,18 @@ async function pullSingleSource(
   }
 
   if (!options.dryRun) {
-    if (repositoryChanged) {
-      // Never label an old producer's historical destination as the new repo.
-      // Protect both foreign owners and newly deployed paths while releasing it.
-      const currentOwners = Object.values(installedPaths).flat().map((installedPath) => ({
-        path: resolveReal(path.resolve(baseDir, installedPath)), repositoryId,
-      }));
-      for (const oldSkill of oldInstalled) {
-        const previousPaths = oldManifest?.installedPaths?.[oldSkill];
-        if (previousPaths && !localTeamSkills.has(oldSkill)) {
-          await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, [...otherOwners, ...currentOwners], previousPaths);
-        }
-      }
-    } else {
-      // Clean up skills no longer public, retaining conflict-skipped old copies.
-      const deployedSet = new Set([...deployed, ...retained]);
-      for (const oldSkill of oldInstalled) {
-        if (!deployedSet.has(oldSkill) && !localTeamSkills.has(oldSkill)) {
-          await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, otherOwners, oldManifest?.installedPaths?.[oldSkill]);
-          log.debug(`[source:${source.name}] Released "${oldSkill}" (no longer public)`);
-          delete installedPaths[oldSkill];
-        }
-      }
+    // Record only this pull's destinations, plus conflict-retained copies.
+    // Release withdrawn skills and old tool paths, even for the same producer;
+    // both foreign ownership and newly deployed paths veto physical deletion.
+    const currentOwners = Object.values(installedPaths).flat().map((installedPath) => ({
+      path: resolveReal(path.resolve(baseDir, installedPath)), repositoryId,
+    }));
+    for (const oldSkill of oldInstalled) {
+      if (retained.has(oldSkill) || localTeamSkills.has(oldSkill)) continue;
+      const previousPaths = oldManifest?.installedPaths?.[oldSkill];
+      // An old producer's unrecorded paths cannot be inferred from the new one.
+      if (repositoryChanged && !previousPaths) continue;
+      await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, [...otherOwners, ...currentOwners], previousPaths);
     }
   }
 
