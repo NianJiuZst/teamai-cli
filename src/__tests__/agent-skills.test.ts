@@ -37,7 +37,7 @@ interface Fixture {
 }
 
 async function makeFixture(): Promise<Fixture> {
-  const tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-agent-skills-'));
+  const tmpDir = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-agent-skills-')));
   const homeDir = path.join(tmpDir, 'home');
   const repoPath = path.join(tmpDir, 'team-repo');
   await fse.ensureDir(path.join(repoPath, 'skills'));
@@ -367,6 +367,7 @@ describe('scanAgentSkills', () => {
       lastPull: '2026-01-01T00:00:00Z', destinationRoot: fx.homeDir,
       installedSkills: ['group/child'],
       installedPaths: { 'group/child': ['.claude/skills/group/child'] },
+      installedPhysicalPaths: { '.claude/skills/group/child': path.join(storage, 'child') },
     });
     const views = await scanInstalledAgents(fx.localConfig, fx.teamConfig);
     expect(views.find((view) => view.agent.id === 'claude')?.skills).toEqual([

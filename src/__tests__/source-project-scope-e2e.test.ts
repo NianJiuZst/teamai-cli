@@ -268,7 +268,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       fs.rmSync(invalidPeer);
       const rootLink = path.join(projectRoot, '.source-root-link');
       fs.symlinkSync(projectRoot, rootLink, 'dir');
-      fs.writeFileSync(manifestPath, JSON.stringify({ ...savedManifest, installedPaths: { 'external-beta-skill': ['.source-root-link'] } }));
+      fs.writeFileSync(manifestPath, JSON.stringify({ ...savedManifest, installedPaths: { 'external-beta-skill': ['.source-root-link'] }, installedPhysicalPaths: { '.source-root-link': fs.realpathSync(projectRoot) } }));
       const blockedRoot = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
       expect(blockedRoot.code, blockedRoot.output).not.toBe(0);
       expect(blockedRoot.output).toContain('Refusing to remove a source destination root');
@@ -293,6 +293,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
         protectedScripts.push(script);
         removalManifest.installedSkills.push(name);
         removalManifest.installedPaths[name] = [relativePath];
+        removalManifest.installedPhysicalPaths[relativePath] = fs.realpathSync(path.dirname(script));
       }
       fs.writeFileSync(manifestPath, JSON.stringify(removalManifest));
 

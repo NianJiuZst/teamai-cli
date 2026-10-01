@@ -264,6 +264,8 @@ export interface SourceInstallManifest {
   installedSkills: string[];
   /** Per-skill deployment paths, relative to the configured scope root. */
   installedPaths?: Record<string, string[]>;
+  /** Original physical destination for each recorded relative deployment path. */
+  installedPhysicalPaths?: Record<string, string>;
 }
 
 /** TTL for source repo pull: don't re-pull within this duration (ms). */

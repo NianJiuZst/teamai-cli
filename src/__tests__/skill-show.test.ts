@@ -26,7 +26,7 @@ interface Fixture {
 }
 
 async function makeFixture(): Promise<Fixture> {
-  const tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skill-show-'));
+  const tmpDir = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-skill-show-')));
   const homeDir = path.join(tmpDir, 'home');
   const repoPath = path.join(tmpDir, 'team-repo');
   await fse.ensureDir(path.join(repoPath, 'skills'));

@@ -32,7 +32,7 @@ describe('nested source ownership boundaries', () => {
   let team: TeamaiConfig;
 
   beforeEach(async () => {
-    root = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-source-nested-'));
+    root = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-source-nested-')));
     home = path.join(root, 'home');
     vi.stubEnv('HOME', home);
     vi.stubEnv('USERPROFILE', home);

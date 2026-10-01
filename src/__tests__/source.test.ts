@@ -39,7 +39,7 @@ describe('source', () => {
   let localConfig: LocalConfig;
 
   beforeEach(async () => {
-    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-source-test-'));
+    tmpDir = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-source-test-')));
     homeDir = path.join(tmpDir, 'home');
     sourcesDir = path.join(homeDir, '.teamai', 'sources');
 
@@ -777,6 +777,7 @@ describe('source', () => {
           lastPull: new Date(0).toISOString(),
           installedSkills: ownership === 'inactive' ? [] : ['old-skill'],
           installedPaths: { 'old-skill': [otherPath] },
+          ...(ownership === 'symlink' ? { installedPhysicalPaths: { [otherPath]: path.join(homeDir, ownPath) } } : {}),
         } satisfies SourceInstallManifest);
         const otherManifest = await fse.readFile(otherManifestPath, 'utf8');
         const repoDir = fixtureSourceRepoDir();
