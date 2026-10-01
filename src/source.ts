@@ -57,6 +57,17 @@ function getSourceDir(sourceName: string): string {
   return path.join(getUserHome(), '.teamai', 'sources', sourceName);
 }
 
+/** Source aliases are metadata identities, not resource directories to filter. */
+async function listSourceNames(): Promise<string[]> {
+  try {
+    const entries = await fse.readdir(path.join(getUserHome(), '.teamai', 'sources'), { withFileTypes: true });
+    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
 function getSourceRepoId(source: SourceConfig): string {
   return createHash('sha256').update(source.repo.trim()).digest('hex');
 }
@@ -1008,8 +1019,7 @@ async function findAmbiguousSourceClaim(skillNames: string[], currentManifest: s
   if (skillNames.length === 0) return undefined;
   const overlaps = (skill: string) => skillNames.some((name) =>
     name === skill || name.startsWith(`${skill}/`) || skill.startsWith(`${name}/`));
-  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
-  for (const sourceName of await listDirs(sourcesDir)) {
+  for (const sourceName of await listSourceNames()) {
     const legacyPath = path.join(getSourceDir(sourceName), 'installed.json');
     const legacy = await readSourceManifest(legacyPath);
     if (legacy?.installedSkills.some(overlaps)) return legacyPath;
@@ -1100,8 +1110,7 @@ export async function getSourcePathOwners(currentManifest?: string): Promise<Sou
     throw new Error('Source ownership is being updated; retry skill push after it finishes.');
   }
   const owners: SourcePathOwner[] = [];
-  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
-  for (const name of await listDirs(sourcesDir)) {
+  for (const name of await listSourceNames()) {
     const installationsDir = path.join(getSourceDir(name), 'installations');
     for (const file of await listFiles(installationsDir)) {
       const manifestPath = path.join(installationsDir, file);
@@ -1167,10 +1176,7 @@ async function removeSkillFromToolPaths(skillName: string, baseDir: string, othe
  */
 export async function getSourceSkillOrigins(localConfig: LocalConfig): Promise<Map<string, string>> {
   const origins = new Map<string, string>();
-  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
-  if (!await pathExists(sourcesDir)) return origins;
-
-  const sourceDirs = await listDirs(sourcesDir);
+  const sourceDirs = await listSourceNames();
   for (const dir of sourceDirs) {
     const manifest = await loadSourceManifest(dir, localConfig);
     if (manifest) {
@@ -1191,8 +1197,7 @@ export async function getSourcePushQuarantineNames(localConfig: LocalConfig): Pr
     // Recursive push scans identify nested skills by their final component.
     names.add(path.posix.basename(skill));
   };
-  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
-  for (const sourceName of await listDirs(sourcesDir)) {
+  for (const sourceName of await listSourceNames()) {
     const currentPath = getSourceManifestPath(sourceName, localConfig);
     const quarantineScoped = (scoped: SourceInstallManifest | null, manifestPath: string) => {
       let ambiguous = false;
