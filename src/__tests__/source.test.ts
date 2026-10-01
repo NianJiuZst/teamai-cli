@@ -388,6 +388,55 @@ describe('source', () => {
       expect(newExists).toBe(true);
     });
 
+    it.each(['same', 'nested', 'ancestor', 'symlink', 'separate', 'prefix', 'inactive', 'unknown-root'])(
+      'coordinates stale cleanup with another installation: %s', async (ownership) => {
+        teamConfig.sources = [{ name: 'platform', repo: 'https://source.test/platform/repo.git' }];
+        const YAML = (await import('yaml')).default;
+        await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+        const ownPath = '.claude/skills/old-skill';
+        await fse.outputFile(path.join(homeDir, ownPath, 'SKILL.md'), '# Shared source copy');
+        await fse.outputJson(getSourceManifestPath('platform', localConfig), {
+          destinationRoot: homeDir, lastPull: new Date(0).toISOString(),
+          installedSkills: ['old-skill'], installedPaths: { 'old-skill': [ownPath] },
+        } satisfies SourceInstallManifest);
+        const otherRoot = ['separate', 'symlink'].includes(ownership) ? path.join(tmpDir, 'other-root') : homeDir;
+        if (ownership === 'symlink') {
+          await fse.ensureDir(otherRoot);
+          await fse.symlink(path.join(homeDir, '.claude'), path.join(otherRoot, '.claude'), 'dir');
+        }
+        const otherPath = ownership === 'nested' ? `${ownPath}/nested`
+          : ownership === 'ancestor' ? '.claude/skills'
+          : ownership === 'prefix' ? `${ownPath}-other` : ownPath;
+        await fse.ensureDir(path.join(otherRoot, otherPath));
+        const otherConfig: LocalConfig = {
+          ...localConfig, repo: { ...localConfig.repo, localPath: path.join(tmpDir, 'other-team') },
+        };
+        const otherManifestPath = getSourceManifestPath('other-alias', otherConfig);
+        await fse.outputJson(otherManifestPath, {
+          ...(ownership === 'unknown-root' ? {} : { destinationRoot: otherRoot }),
+          lastPull: new Date(0).toISOString(),
+          installedSkills: ownership === 'inactive' ? [] : ['old-skill'],
+          installedPaths: { 'old-skill': [otherPath] },
+        } satisfies SourceInstallManifest);
+        const otherManifest = await fse.readFile(otherManifestPath, 'utf8');
+        const repoDir = fixtureSourceRepoDir();
+        await fse.outputFile(path.join(repoDir, 'skills', 'new-skill', 'SKILL.md'), '# New');
+        await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({
+          team: 'platform', repo: teamConfig.sources[0].repo, publicSkills: ['new-skill'],
+        }));
+
+        await pullSources(localConfig, { force: true });
+
+        expect(await fse.pathExists(path.join(homeDir, ownPath, 'SKILL.md')))
+          .toBe(['same', 'nested', 'ancestor', 'symlink'].includes(ownership));
+        expect(await fse.readFile(otherManifestPath, 'utf8')).toBe(otherManifest);
+        const current = await fse.readJson(getSourceManifestPath('platform', localConfig)) as SourceInstallManifest;
+        expect(current.destinationRoot).toBe(homeDir);
+        expect(current.installedSkills).toEqual(['new-skill']);
+        expect(current.installedPaths?.['old-skill']).toBeUndefined();
+      },
+    );
+
     it('should handle dry-run mode', async () => {
       teamConfig.sources = [{ name: 'platform', repo: 'git@git.woa.com:platform/repo.git' }];
 

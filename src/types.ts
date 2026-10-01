@@ -252,6 +252,8 @@ export type SourceConfig = z.infer<typeof SourceConfigSchema>;
 
 /** Source installation manifest, keyed by team checkout and resource destination. */
 export interface SourceInstallManifest {
+  /** Absolute destination root, allowing other installations to protect shared paths. */
+  destinationRoot?: string;
   /** ISO timestamp of last successful pull. */
   lastPull: string;
   /** Skill names currently deployed from this source. */
