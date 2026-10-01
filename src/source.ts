@@ -23,6 +23,7 @@ import { ResourceHandler } from './resources/base.js';
 import { resolveSkillDestination } from './resources/skills.js';
 import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { getUserHome } from './utils/home.js';
+import { acquireLock, releaseLock } from './update.js';
 import { assertSafeResourceName, assertWithinRoot, resolveReal } from './utils/path-safety.js';
 import type {
   TeamaiConfig,
@@ -34,6 +35,22 @@ import type {
 import { resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
 
 // ─── Source repo management ──────────────────────────────
+
+function sourceLockPath(): string {
+  return path.join(getUserHome(), '.teamai', 'sources', '.lifecycle-lock');
+}
+
+async function withSourceLock(options: GlobalOptions, action: () => Promise<void>): Promise<void> {
+  const lock = sourceLockPath();
+  if (!await acquireLock(lock, { dryRun: options.dryRun })) {
+    throw new Error('Could not acquire the shared source lock. Retry after other source operations finish and check cache permissions.');
+  }
+  try {
+    await action();
+  } finally {
+    if (!options.dryRun) await releaseLock(lock);
+  }
+}
 
 function getSourceDir(sourceName: string): string {
   assertSafeResourceName(sourceName);
@@ -60,8 +77,36 @@ export function getSourceManifestPath(sourceName: string, localConfig: LocalConf
   return path.join(getSourceDir(sourceName), 'installations', `${installationId}.json`);
 }
 
+async function readSourceManifest(manifestPath: string): Promise<SourceInstallManifest | null> {
+  let raw: string;
+  try {
+    raw = await fse.readFile(manifestPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`Cannot read source ownership record: ${manifestPath}`);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error(`Invalid JSON in source ownership record: ${manifestPath}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Invalid source ownership record: ${manifestPath}`);
+  }
+  const manifest = value as SourceInstallManifest;
+  if (!Array.isArray(manifest.installedSkills) || !manifest.installedSkills.every((skill) => typeof skill === 'string')
+    || (manifest.installedPaths !== undefined && (!manifest.installedPaths || typeof manifest.installedPaths !== 'object'
+      || Array.isArray(manifest.installedPaths) || !Object.values(manifest.installedPaths).every((paths) => Array.isArray(paths) && paths.every((target) => typeof target === 'string'))))
+    || (manifest.destinationRoot !== undefined && (typeof manifest.destinationRoot !== 'string' || !path.isAbsolute(manifest.destinationRoot)))
+    || (manifest.repositoryId !== undefined && typeof manifest.repositoryId !== 'string')) {
+    throw new Error(`Invalid source ownership record: ${manifestPath}`);
+  }
+  return manifest;
+}
+
 async function loadSourceManifest(sourceName: string, localConfig: LocalConfig): Promise<SourceInstallManifest | null> {
-  return readJson<SourceInstallManifest>(getSourceManifestPath(sourceName, localConfig));
+  return readSourceManifest(getSourceManifestPath(sourceName, localConfig));
 }
 
 async function saveSourceManifest(sourceName: string, localConfig: LocalConfig, manifest: SourceInstallManifest): Promise<void> {
@@ -141,6 +186,11 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean): Promise<s
  */
 export async function sourceAdd(repoUrl: string, options: { name?: string } & GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  await withSourceLock(options, () => sourceAddLocked(repoUrl, options, localConfig, teamConfig));
+}
+
+async function sourceAddLocked(repoUrl: string, options: { name?: string } & GlobalOptions, localConfig: LocalConfig, initialTeamConfig: TeamaiConfig): Promise<void> {
+  const teamConfig = await loadTeamConfig(localConfig.repo.localPath) ?? initialTeamConfig;
   const repoPath = localConfig.repo.localPath;
 
   // Derive name from repo URL if not provided
@@ -212,6 +262,11 @@ export async function sourceAdd(repoUrl: string, options: { name?: string } & Gl
  */
 export async function sourceRemove(name: string, options: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  await withSourceLock(options, () => sourceRemoveLocked(name, options, localConfig, teamConfig));
+}
+
+async function sourceRemoveLocked(name: string, options: GlobalOptions, localConfig: LocalConfig, initialTeamConfig: TeamaiConfig): Promise<void> {
+  const teamConfig = await loadTeamConfig(localConfig.repo.localPath) ?? initialTeamConfig;
   const repoPath = localConfig.repo.localPath;
 
   const existing = teamConfig.sources ?? [];
@@ -356,7 +411,12 @@ export async function sourceRemoveHttp(options: GlobalOptions): Promise<void> {
  */
 export async function sourceBrowse(name: string, options: GlobalOptions): Promise<void> {
   // Read-only: the load never persists a migration (#893).
-  const { teamConfig } = await autoDetectInit(undefined, { dryRun: true });
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
+  await withSourceLock(options, () => sourceBrowseLocked(name, options, localConfig, teamConfig));
+}
+
+async function sourceBrowseLocked(name: string, options: GlobalOptions, localConfig: LocalConfig, initialTeamConfig: TeamaiConfig): Promise<void> {
+  const teamConfig = await loadTeamConfig(localConfig.repo.localPath) ?? initialTeamConfig;
   const sources = teamConfig.sources ?? [];
   const source = sources.find((s) => s.name === name);
 
@@ -416,6 +476,15 @@ export async function sourceBrowse(name: string, options: GlobalOptions): Promis
  * Called from pull() at the top level (not inside pullForScope).
  */
 export async function pullSources(localConfig: LocalConfig, options: GlobalOptions): Promise<void> {
+  if (!(await loadTeamConfig(localConfig.repo.localPath))?.sources?.length) return;
+  try {
+    await withSourceLock(options, () => pullSourcesLocked(localConfig, options));
+  } catch (error) {
+    log.warn(`[source] ${(error as Error).message}`);
+  }
+}
+
+async function pullSourcesLocked(localConfig: LocalConfig, options: GlobalOptions): Promise<void> {
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   if (!teamConfig) return;
 
@@ -477,17 +546,18 @@ async function pullSingleSource(
 
   // Collect skills that belong to the local team (they take priority)
   const localTeamSkills = await getLocalTeamSkillNames(teamConfig, localConfig);
-  const otherOwners = await getOtherSourcePathOwners(source.name, localConfig);
+  const otherOwners = await getSourcePathOwners(getSourceManifestPath(source.name, localConfig));
   const repositoryId = getSourceRepoId(source);
+  const repositoryChanged = !!oldManifest && oldManifest.repositoryId !== repositoryId;
 
   // Deploy skills to tool paths
   const deployed: string[] = [];
   const retained = new Set<string>();
-  const installedPaths: Record<string, string[]> = { ...oldManifest?.installedPaths };
+  const installedPaths: Record<string, string[]> = repositoryChanged ? {} : { ...oldManifest?.installedPaths };
   let newCount = 0;
   let updatedCount = 0;
 
-  const plans: Array<{ skill: (typeof skillsToDeploy)[number]; targets: string[]; conflictingPath?: string }> = [];
+  const plans: Array<{ skill: (typeof skillsToDeploy)[number]; targets: string[]; conflictingPath?: string; conflictingRecord?: string }> = [];
   for (const skill of skillsToDeploy) {
     // Local team skills take priority: skip source skill if name conflicts
     if (localTeamSkills.has(skill.name)) {
@@ -499,30 +569,33 @@ async function pullSingleSource(
     // must not delete a path before cross-installation ownership is checked.
     const targets: string[] = [];
     let conflictingPath: string | undefined;
+    let conflictingRecord: string | undefined;
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills || !await ResourceHandler.isToolInstalled(toolPath.skills, baseDir)) continue;
       const target = await resolveSkillDestination(tool, toolPath.skills, baseDir, skill.name);
       targets.push(target);
       const physical = resolveReal(target);
-      if (otherOwners.some((owner) => owner.repositoryId !== repositoryId && pathsOverlap(owner.path, physical))) {
+      const owner = otherOwners.find((candidate) => candidate.repositoryId !== repositoryId && pathsOverlap(candidate.path, physical));
+      if (owner) {
         conflictingPath = target;
+        conflictingRecord = owner.manifestPath;
       }
     }
-    plans.push({ skill, targets, conflictingPath });
+    plans.push({ skill, targets, conflictingPath, conflictingRecord });
   }
 
   // A repository replacement cannot retain old content under the new identity.
   // Preflight every skill before writing so a conflict preserves the old record
   // and files intact, without leaving unrecorded partial replacements behind.
   const conflict = plans.find((plan) => plan.conflictingPath);
-  if (conflict && oldManifest && oldManifest.repositoryId !== repositoryId) {
-    log.warn(`[source:${source.name}] Cannot replace this installation: another source repository owns ${conflict.conflictingPath}. Keeping previous installation.`);
+  if (conflict && repositoryChanged) {
+    log.warn(`[source:${source.name}] Cannot replace this installation: another source repository owns ${conflict.conflictingPath}. Keeping previous installation. Ownership record: ${conflict.conflictingRecord}`);
     return;
   }
 
-  for (const { skill, targets, conflictingPath } of plans) {
+  for (const { skill, targets, conflictingPath, conflictingRecord } of plans) {
     if (conflictingPath) {
-      log.warn(`[source:${source.name}] Skipping "${skill.name}": another source repository owns ${conflictingPath}. Remove that installation before pulling this skill.`);
+      log.warn(`[source:${source.name}] Skipping "${skill.name}": another source repository owns ${conflictingPath}. Remove that installation before pulling this skill. Ownership record: ${conflictingRecord}`);
       if (oldInstalled.has(skill.name)) retained.add(skill.name);
       continue;
     }
@@ -550,14 +623,28 @@ async function pullSingleSource(
     deployed.push(skill.name);
   }
 
-  // Clean up skills that were previously installed but are no longer in publicSkills
   if (!options.dryRun) {
-    const deployedSet = new Set([...deployed, ...retained]);
-    for (const oldSkill of oldInstalled) {
-      if (!deployedSet.has(oldSkill) && !localTeamSkills.has(oldSkill)) {
-        await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, otherOwners, oldManifest?.installedPaths?.[oldSkill]);
-        log.debug(`[source:${source.name}] Released "${oldSkill}" (no longer public)`);
-        delete installedPaths[oldSkill];
+    if (repositoryChanged) {
+      // Never label an old producer's historical destination as the new repo.
+      // Protect both foreign owners and newly deployed paths while releasing it.
+      const currentOwners = Object.values(installedPaths).flat().map((installedPath) => ({
+        path: resolveReal(path.resolve(baseDir, installedPath)), repositoryId,
+      }));
+      for (const oldSkill of oldInstalled) {
+        const previousPaths = oldManifest?.installedPaths?.[oldSkill];
+        if (previousPaths && !localTeamSkills.has(oldSkill)) {
+          await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, [...otherOwners, ...currentOwners], previousPaths);
+        }
+      }
+    } else {
+      // Clean up skills no longer public, retaining conflict-skipped old copies.
+      const deployedSet = new Set([...deployed, ...retained]);
+      for (const oldSkill of oldInstalled) {
+        if (!deployedSet.has(oldSkill) && !localTeamSkills.has(oldSkill)) {
+          await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, otherOwners, oldManifest?.installedPaths?.[oldSkill]);
+          log.debug(`[source:${source.name}] Released "${oldSkill}" (no longer public)`);
+          delete installedPaths[oldSkill];
+        }
       }
     }
   }
@@ -566,6 +653,7 @@ async function pullSingleSource(
   if (!options.dryRun) {
     await saveSourceManifest(source.name, localConfig, {
       destinationRoot: path.resolve(baseDir),
+      teamCheckout: path.resolve(localConfig.repo.localPath),
       repositoryId,
       lastPull: new Date().toISOString(),
       installedSkills: [...deployed, ...retained],
@@ -693,6 +781,7 @@ async function getLocalTeamSkillNames(teamConfig: TeamaiConfig, localConfig: Loc
 
 interface SourcePathOwner {
   path: string;
+  manifestPath?: string;
   repositoryId?: string;
 }
 
@@ -701,8 +790,12 @@ function pathsOverlap(first: string, second: string): boolean {
 }
 
 /** Foreign ownership can veto writes/deletion, never authorize them. */
-async function getOtherSourcePathOwners(sourceName: string, localConfig: LocalConfig): Promise<SourcePathOwner[]> {
-  const currentManifest = getSourceManifestPath(sourceName, localConfig);
+export async function getSourcePathOwners(currentManifest?: string): Promise<SourcePathOwner[]> {
+  // Public push readers must not inspect a source transaction in progress.
+  // Mutation callers already hold the lock and pass their current manifest.
+  if (!currentManifest && !await acquireLock(sourceLockPath(), { dryRun: true })) {
+    throw new Error('Source ownership is being updated; retry skill push after it finishes.');
+  }
   const owners: SourcePathOwner[] = [];
   const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
   for (const name of await listDirs(sourcesDir)) {
@@ -710,7 +803,7 @@ async function getOtherSourcePathOwners(sourceName: string, localConfig: LocalCo
     for (const file of await listFiles(installationsDir)) {
       const manifestPath = path.join(installationsDir, file);
       if (manifestPath === currentManifest || !file.endsWith('.json')) continue;
-      const manifest = await readJson<SourceInstallManifest>(manifestPath);
+      const manifest = await readSourceManifest(manifestPath);
       if (!manifest || typeof manifest.destinationRoot !== 'string' || !path.isAbsolute(manifest.destinationRoot)) continue;
       const root = path.resolve(manifest.destinationRoot);
       for (const skill of manifest.installedSkills) {
@@ -719,7 +812,7 @@ async function getOtherSourcePathOwners(sourceName: string, localConfig: LocalCo
           const target = path.resolve(root, installedPath);
           const relative = path.relative(root, target);
           if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
-          owners.push({ path: resolveReal(target), repositoryId: manifest.repositoryId });
+          owners.push({ path: resolveReal(target), manifestPath, repositoryId: manifest.repositoryId });
         }
       }
     }
@@ -736,8 +829,9 @@ async function removeSkillFromToolPaths(skillName: string, teamConfig: TeamaiCon
     assertWithinRoot(baseDir, skillDir);
     if (!await pathExists(skillDir)) continue;
     const physicalPath = resolveReal(skillDir);
-    if (otherOwners.some((owner) => pathsOverlap(owner.path, physicalPath))) {
-      log.debug(`Keeping "${skillDir}" (another source installation owns this path)`);
+    const owner = otherOwners.find((candidate) => pathsOverlap(candidate.path, physicalPath));
+    if (owner) {
+      if (owner.manifestPath) log.info(`Kept "${skillDir}" because another source installation owns it. Ownership record: ${owner.manifestPath}`);
       continue;
     }
     await remove(skillDir);
@@ -752,7 +846,7 @@ async function cleanupSourceSkills(sourceName: string, teamConfig: TeamaiConfig,
   if (!manifest) return;
 
   const baseDir = resolveBaseDir(localConfig);
-  const otherOwners = await getOtherSourcePathOwners(sourceName, localConfig);
+  const otherOwners = await getSourcePathOwners(getSourceManifestPath(sourceName, localConfig));
   for (const skillName of manifest.installedSkills) {
     await removeSkillFromToolPaths(skillName, teamConfig, localConfig, baseDir, otherOwners, manifest.installedPaths?.[skillName]);
   }
@@ -779,7 +873,16 @@ export async function getSourceSkillOrigins(localConfig: LocalConfig): Promise<M
   return origins;
 }
 
-/** Exclude only this scope's installed source skills from push candidates. */
+/** Exclude known source skills and quarantine ambiguous legacy names from push. */
 export async function getAllSourceSkillNames(localConfig: LocalConfig): Promise<Set<string>> {
-  return new Set((await getSourceSkillOrigins(localConfig)).keys());
+  const names = new Set((await getSourceSkillOrigins(localConfig)).keys());
+  const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
+  for (const sourceName of await listDirs(sourcesDir)) {
+    const legacyPath = path.join(getSourceDir(sourceName), 'installed.json');
+    const legacy = await readSourceManifest(legacyPath);
+    if (!Array.isArray(legacy?.installedSkills) || legacy.installedSkills.length === 0) continue;
+    for (const name of legacy.installedSkills) if (typeof name === 'string') names.add(name);
+    log.warn(`[source:${sourceName}] Legacy tracking has no destination identity. Matching skill names are excluded from push until you review ${legacyPath}.`);
+  }
+  return names;
 }

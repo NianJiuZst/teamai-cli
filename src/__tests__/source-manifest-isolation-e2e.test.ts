@@ -81,6 +81,8 @@ it.each([false, true])('keeps installation ownership separate (shared team check
       const installationId = createHash('sha256').update(JSON.stringify([project, teamRepo])).digest('hex');
       manifests.push(path.join(home, '.teamai', 'sources', 'shared', 'installations', `${installationId}.json`));
     }
+    expect(run(['push', '--dry-run'], projects[0])).toContain('Legacy tracking has no destination identity.');
+    expect(fs.readFileSync(legacyPath, 'utf8')).toBe(legacyManifest);
     run(['pull', '--force'], projects[0]);
     expect(fs.readFileSync(skill(projects[0], 'old-skill'), 'utf8')).toBe('# Source old-skill\n');
     expect(fs.readFileSync(skill(projects[0], 'legacy-local'), 'utf8')).toBe('# alpha legacy local draft\n');

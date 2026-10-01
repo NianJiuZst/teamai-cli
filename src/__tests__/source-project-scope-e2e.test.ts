@@ -187,6 +187,31 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).installedSkills)
         .toEqual(['external-beta-skill']);
 
+      const manifestBytes = fs.readFileSync(manifestPath, 'utf8');
+      const configBytes = fs.readFileSync(teamYamlPath, 'utf8');
+      const sourceLock = path.join(home, '.teamai', 'sources', '.lifecycle-lock');
+      const lockBytes = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'e2e-holder' });
+      fs.writeFileSync(sourceLock, lockBytes);
+      for (const args of [
+        ['source', 'remove', 'beta-source'],
+        ['source', 'remove', 'beta-source', '--dry-run'],
+        ['source', 'add', sourceUrl, '--name', 'blocked-source'],
+        ['source', 'browse', 'beta-source'],
+      ]) {
+        const blocked = await runCLI(args, projectRoot, home, sourceGitEnv);
+        expect(blocked.code, blocked.output).not.toBe(0);
+        expect(blocked.output).toContain('Could not acquire the shared source lock');
+        expect(fs.readFileSync(sourceLock, 'utf8')).toBe(lockBytes);
+        expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
+        expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+      }
+      fs.rmSync(sourceLock);
+      const invalid = await runCLI(['source', 'remove', '..'], projectRoot, home, sourceGitEnv);
+      expect(invalid.code, invalid.output).not.toBe(0);
+      expect(fs.existsSync(sourceLock)).toBe(false);
+      expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
+      expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+
       const removeResult = await runCLI(
         ['source', 'remove', 'beta-source'],
         projectRoot,
@@ -197,6 +222,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(removeResult.output).toContain('Removed source "beta-source"');
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
       expect(fs.existsSync(manifestPath)).toBe(false);
+      expect(fs.existsSync(sourceLock)).toBe(false);
       const repoId = createHash('sha256').update(sourceUrl).digest('hex');
       expect(fs.existsSync(path.join(home, '.teamai', 'sources', 'beta-source', 'repos', repoId, 'repo'))).toBe(true);
       expect(

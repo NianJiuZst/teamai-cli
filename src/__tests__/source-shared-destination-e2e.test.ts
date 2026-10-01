@@ -115,6 +115,7 @@ it.each([
         const betaManifest = JSON.parse(fs.readFileSync(beta.manifest, 'utf8'));
         expect(betaManifest.installedSkills).toEqual([]);
         expect(betaManifest.installedPaths).not.toHaveProperty('old-skill');
+        expect(run(['push', '--dry-run'])).toContain('owned by another source installation and is excluded from push.');
         expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
       } else {
         run(['pull', '--force']);
