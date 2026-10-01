@@ -23,6 +23,7 @@ it.each([
   { cleanup: 'absent', sameAlias: false },
   { cleanup: 'missing-directories', sameAlias: true },
   { cleanup: 'retarget', sameAlias: false },
+  { cleanup: 'refresh', sameAlias: false },
 ])('preserves a shared user-scope destination until its last owner leaves ($cleanup, same alias: $sameAlias)', ({ cleanup, sameAlias }) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-shared-destination-')));
   const home = path.join(root, 'home');
@@ -135,6 +136,34 @@ it.each([
     const betaManifest = fs.readFileSync(beta.manifest, 'utf8');
     fs.mkdirSync(path.dirname(skill('local-draft')), { recursive: true });
     fs.writeFileSync(skill('local-draft'), '# Unrelated local draft\n');
+
+    if (cleanup === 'refresh') {
+      fs.writeFileSync(path.join(sourceSeed, 'skills/old-skill/SKILL.md'), '# Source revision B\n');
+      git(['add', '-A'], sourceSeed);
+      git(['-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'update shared revision'], sourceSeed);
+      git(['push', '-q', sourceRemote, 'main'], sourceSeed);
+      fs.writeFileSync(path.join(home, '.teamai/config.yaml'), YAML.stringify(alpha.config));
+      run(['pull', '--force']);
+      const alphaManifest = fs.readFileSync(alpha.manifest, 'utf8');
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source revision B\n');
+      fs.writeFileSync(path.join(home, '.teamai/config.yaml'), YAML.stringify(beta.config));
+      // A TTL hit under beta's alias must not revert alpha's refreshed revision.
+      run(['pull']);
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source revision B\n');
+      fs.renameSync(sourceRemote, `${sourceRemote}.offline`);
+      expect(run(['pull', '--force'])).toContain(`[source:${beta.alias}] Pull failed:`);
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source revision B\n');
+      run(['source', 'remove', beta.alias]);
+      expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source revision B\n');
+      fs.writeFileSync(path.join(home, '.teamai/config.yaml'), YAML.stringify(alpha.config));
+      expect(run(['pull', '--force'])).toContain(`[source:${alpha.alias}] Pull failed:`);
+      expect(fs.readFileSync(skill('old-skill'), 'utf8')).toBe('# Source revision B\n');
+      run(['source', 'remove', alpha.alias]);
+      expect(fs.existsSync(skill('old-skill'))).toBe(false);
+      expect(fs.readFileSync(skill('local-draft'), 'utf8')).toBe('# Unrelated local draft\n');
+      return;
+    }
 
     if (cleanup === 'conflict') {
       const alphaManifest = fs.readFileSync(alpha.manifest, 'utf8');

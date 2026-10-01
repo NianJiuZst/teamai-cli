@@ -195,7 +195,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
         .toEqual(['external-beta-skill']);
 
       const repoId = createHash('sha256').update(sourceUrl).digest('hex');
-      const cacheStamp = path.join(home, '.teamai', 'sources', 'beta-source', 'repos', repoId, 'last-pull.json');
+      const cacheStamp = path.join(home, '.teamai', 'source-repos', repoId, 'last-pull.json');
       const expiredStamp = JSON.stringify({ lastPull: new Date(0).toISOString() });
       fs.writeFileSync(cacheStamp, expiredStamp);
       for (const args of [['source', 'browse', 'beta-source', '--dry-run'], ['pull', '--force', '--dry-run']]) {
@@ -241,7 +241,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
       expect(fs.existsSync(manifestPath)).toBe(false);
       expect(fs.existsSync(sourceLock)).toBe(false);
-      expect(fs.existsSync(path.join(home, '.teamai', 'sources', 'beta-source', 'repos', repoId, 'repo'))).toBe(true);
+      expect(fs.existsSync(path.join(home, '.teamai', 'source-repos', repoId, 'repo'))).toBe(true);
       expect(
         fs.existsSync(path.join(projectRoot, '.claude', 'skills', 'external-beta-skill')),
       ).toBe(false);

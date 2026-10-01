@@ -62,7 +62,8 @@ function getSourceRepoId(source: SourceConfig): string {
 }
 
 function getSourceRepoCacheDir(source: SourceConfig): string {
-  return path.join(getSourceDir(source.name), 'repos', getSourceRepoId(source));
+  // Aliases sharing a producer must share its revision and TTL as well.
+  return path.join(getUserHome(), '.teamai', 'source-repos', getSourceRepoId(source));
 }
 
 function getSourceRepoDir(source: SourceConfig): string {
@@ -283,9 +284,17 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
   const source = existing.find((s) => s.name === name);
   // A different destination may already have removed this source from the
   // shared team checkout. Its absence must not strand this installation.
-  if (!source && !await loadSourceManifest(name, localConfig)) {
+  const manifest = await loadSourceManifest(name, localConfig);
+  if (!source && !manifest) {
     log.error(`Source "${name}" not found. Run \`teamai source list\` to see configured sources.`);
     return;
+  }
+
+  // A shared checkout may have re-used this alias for a different producer.
+  // Old (or unidentified) scoped ownership only authorizes local cleanup.
+  const removeSubscription = !!source && (!manifest || manifest.repositoryId === getSourceRepoId(source));
+  if (source && !removeSubscription) {
+    log.info(`Keeping source "${name}" configuration: this installation does not belong to its current repository.`);
   }
 
   if (options.dryRun) {
@@ -293,7 +302,7 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
     return;
   }
 
-  if (source) {
+  if (removeSubscription) {
     // Update teamai.yaml
     const yamlPath = path.join(repoPath, 'teamai.yaml');
     const content = await readFileSafe(yamlPath);
@@ -314,7 +323,7 @@ async function sourceRemoveLocked(name: string, options: GlobalOptions, localCon
   await remove(getSourceManifestPath(name, localConfig));
 
   log.success(`Removed source "${name}"`);
-  if (source) log.info('Run `teamai push` to share this change with your team.');
+  if (removeSubscription) log.info('Run `teamai push` to share this change with your team.');
 }
 
 /**

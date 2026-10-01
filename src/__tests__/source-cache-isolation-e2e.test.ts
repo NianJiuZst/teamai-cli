@@ -71,7 +71,7 @@ it('keeps same-named source repos separate across teams, including removal and c
       projects.push(project);
       sourceRemotes.push(sourceRemote);
     }
-    const caches = path.join(home, '.teamai', 'sources', 'shared', 'repos');
+    const caches = path.join(home, '.teamai', 'source-repos');
     expect(fs.readdirSync(caches)).toHaveLength(2);
     run(['source', 'remove', 'shared'], projects[0]);
     expect(fs.readdirSync(caches)).toHaveLength(2);

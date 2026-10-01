@@ -131,3 +131,118 @@ it.each([false, true])('keeps installation ownership separate (shared team check
     fs.rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+it.each([true, false])('removes stale ownership without deleting a replacement alias (identified stale manifest: %s)', (identified) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-alias-replacement-')));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home);
+  const env = {
+    ...process.env, ...GIT_ENV, HOME: home, USERPROFILE: home, FORCE_COLOR: '0',
+    GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
+  };
+  const git = (args: string[], cwd: string) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const run = (args: string[], cwd: string) => {
+    const result = spawnSync(process.execPath, [CLI, ...args], { cwd, env, encoding: 'utf8', timeout: 30_000 });
+    const output = result.stdout + result.stderr;
+    expect(result.error, output).toBeUndefined();
+    expect(result.status, output).toBe(0);
+    return output;
+  };
+  const skill = (project: string, name: string) => path.join(project, '.claude', 'skills', name, 'SKILL.md');
+  try {
+    const sourceUrls = ['https://source.test/original/skills.git', 'https://source.test/replacement/skills.git'];
+    for (const [index, name] of ['old-skill', 'new-skill'].entries()) {
+      const sourceSeed = path.join(root, `${name}-source-seed`);
+      const sourceRemote = path.join(root, `${name}-source.git`);
+      fs.mkdirSync(path.join(sourceSeed, 'skills', name), { recursive: true });
+      fs.writeFileSync(path.join(sourceSeed, 'skills', name, 'SKILL.md'), `# Source ${name}\n`);
+      fs.writeFileSync(path.join(sourceSeed, 'teamai.yaml'), YAML.stringify({
+        team: name, repo: sourceUrls[index], publicSkills: [name],
+      }));
+      git(['init', '-q', '-b', 'main'], sourceSeed);
+      git(['add', '-A'], sourceSeed);
+      git(['-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'seed source'], sourceSeed);
+      git(['clone', '-q', '--bare', sourceSeed, sourceRemote], root);
+      git(['config', '--file', path.join(home, '.gitconfig'), `url.file://${sourceRemote}.insteadOf`, sourceUrls[index]], root);
+    }
+
+    const teamRepo = path.join(root, 'shared-team-repo');
+    const teamRemote = path.join(root, 'shared-team.git');
+    const teamYaml = path.join(teamRepo, 'teamai.yaml');
+    fs.mkdirSync(teamRepo);
+    fs.writeFileSync(teamYaml, YAML.stringify({
+      team: 'shared-checkout', repo: teamRemote, provider: 'git', reviewers: [],
+      sources: [{ name: 'shared', repo: sourceUrls[0] }],
+      toolPaths: { claude: { skills: '.claude/skills' } },
+    }));
+    git(['init', '-q', '-b', 'main'], teamRepo);
+    git(['add', '-A'], teamRepo);
+    git(['-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'seed team'], teamRepo);
+    git(['clone', '-q', '--bare', teamRepo, teamRemote], root);
+    git(['remote', 'add', 'origin', teamRemote], teamRepo);
+    git(['push', '-q', '--set-upstream', 'origin', 'main'], teamRepo);
+
+    const projects = ['alpha', 'beta'].map((name) => {
+      const project = path.join(root, name);
+      fs.mkdirSync(path.join(project, '.teamai'), { recursive: true });
+      fs.mkdirSync(path.join(project, '.claude', 'skills'), { recursive: true });
+      fs.writeFileSync(path.join(project, '.teamai', 'config.yaml'), YAML.stringify({
+        repo: { localPath: teamRepo, remote: teamRemote }, username: 'tester',
+        updatePolicy: 'skip', scope: 'project', projectRoot: project,
+      }));
+      const installationId = createHash('sha256').update(JSON.stringify([project, teamRepo])).digest('hex');
+      const manifest = path.join(home, '.teamai', 'sources', 'shared', 'installations', `${installationId}.json`);
+      run(['pull', '--force'], project);
+      expect(fs.readFileSync(skill(project, 'old-skill'), 'utf8')).toBe('# Source old-skill\n');
+      expect(JSON.parse(fs.readFileSync(manifest, 'utf8')).repositoryId)
+        .toBe(createHash('sha256').update(sourceUrls[0]).digest('hex'));
+      fs.mkdirSync(path.dirname(skill(project, 'local-draft')), { recursive: true });
+      fs.writeFileSync(skill(project, 'local-draft'), `# ${name} local draft\n`);
+      return { project, manifest };
+    });
+    const [alpha, beta] = projects;
+    if (!identified) {
+      const manifest = JSON.parse(fs.readFileSync(beta.manifest, 'utf8'));
+      delete manifest.repositoryId;
+      fs.writeFileSync(beta.manifest, JSON.stringify(manifest, null, 2));
+    }
+    const betaManifest = fs.readFileSync(beta.manifest, 'utf8');
+    expect(run(['source', 'remove', 'shared'], alpha.project)).toContain('Removed source "shared"');
+    expect(fs.existsSync(alpha.manifest)).toBe(false);
+    expect(fs.existsSync(path.dirname(skill(alpha.project, 'old-skill')))).toBe(false);
+    expect(fs.readFileSync(beta.manifest, 'utf8')).toBe(betaManifest);
+    expect(fs.readFileSync(skill(beta.project, 'old-skill'), 'utf8')).toBe('# Source old-skill\n');
+    expect(YAML.parse(fs.readFileSync(teamYaml, 'utf8')).sources).toEqual([]);
+
+    expect(run(['source', 'add', sourceUrls[1], '--name', 'shared'], alpha.project)).toContain('Added source "shared"');
+    run(['pull', '--force'], alpha.project);
+    expect(fs.readFileSync(skill(alpha.project, 'new-skill'), 'utf8')).toBe('# Source new-skill\n');
+    const alphaManifest = fs.readFileSync(alpha.manifest, 'utf8');
+    expect(JSON.parse(alphaManifest).repositoryId).toBe(createHash('sha256').update(sourceUrls[1]).digest('hex'));
+    expect(fs.readFileSync(beta.manifest, 'utf8')).toBe(betaManifest);
+    fs.appendFileSync(teamYaml, '# Preserve the replacement source and this comment.\n');
+    const replacementYaml = fs.readFileSync(teamYaml, 'utf8');
+    expect(YAML.parse(replacementYaml).sources).toEqual([{ name: 'shared', repo: sourceUrls[1] }]);
+
+    expect(run(['source', 'remove', 'shared', '--dry-run'], beta.project)).toContain('[dry-run] Would remove source "shared"');
+    expect(fs.readFileSync(teamYaml, 'utf8')).toBe(replacementYaml);
+    expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
+    expect(fs.readFileSync(beta.manifest, 'utf8')).toBe(betaManifest);
+    expect(fs.readFileSync(skill(alpha.project, 'new-skill'), 'utf8')).toBe('# Source new-skill\n');
+    expect(fs.readFileSync(skill(beta.project, 'old-skill'), 'utf8')).toBe('# Source old-skill\n');
+
+    const removeOutput = run(['source', 'remove', 'shared'], beta.project);
+    expect(removeOutput).toContain('Removed source "shared"');
+    expect(fs.existsSync(beta.manifest)).toBe(false);
+    expect(fs.existsSync(path.dirname(skill(beta.project, 'old-skill')))).toBe(false);
+    // Assert preservation immediately; a later pull must not repair the regression.
+    expect(fs.readFileSync(teamYaml, 'utf8')).toBe(replacementYaml);
+    expect(removeOutput).not.toContain('Run `teamai push`');
+    expect(fs.readFileSync(alpha.manifest, 'utf8')).toBe(alphaManifest);
+    expect(fs.readFileSync(skill(alpha.project, 'new-skill'), 'utf8')).toBe('# Source new-skill\n');
+    expect(fs.readFileSync(skill(alpha.project, 'local-draft'), 'utf8')).toBe('# alpha local draft\n');
+    expect(fs.readFileSync(skill(beta.project, 'local-draft'), 'utf8')).toBe('# beta local draft\n');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);

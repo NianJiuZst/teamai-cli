@@ -113,9 +113,9 @@ teamai recall <q>  # Search what the team has already learned
 teamai env exec -- <cmd>  # Run a CLI with this directory's team env and secrets
 ```
 
-Git subscription caches are keyed by source name and repository URL, so different teams may reuse a source name. Changing the URL clones the newly configured repository; a failed pull uses only that repository's cache. `source remove` retains repository caches for other installations.
+Git subscription caches are keyed by repository URL hash and shared across aliases, so the same URL shares its revision and TTL while different URLs remain isolated. Changing the URL uses the newly configured repository’s cache; a failed pull uses only that repository's cache. `source remove` retains repository caches for other installations.
 
-Git source installations are keyed by team checkout and destination (HOME, project, or worktree). `source remove` releases the current installation and retains shared caches/other owners. It can still clean a scoped record after another destination removed the alias from shared team configuration. Physical paths remain until their last source owner releases them.
+Git source installations are keyed by team checkout and destination (HOME, project, or worktree). `source remove` releases the current installation and retains shared caches/other owners. It can still clean a scoped record after another destination removed the alias from shared team configuration. If that alias was re-added for a different repository, stale or unidentified records authorize only local cleanup and preserve the new subscription. Physical paths remain until their last source owner releases them.
 
 Pull skips a skill when a different or unidentified repository owns an overlapping target; same-repository installations can share it. Existing copies survive conflicts, and a conflicting repository replacement preserves the old installation. A successful replacement records only its new destinations. Dry-run does not change skills or installation manifests.
 

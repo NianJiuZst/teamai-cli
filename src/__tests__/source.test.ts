@@ -213,7 +213,7 @@ describe('source', () => {
 
   function fixtureSourceRepoDir(): string {
     const source = teamConfig.sources![0];
-    return path.join(sourcesDir, source.name, 'repos', createHash('sha256').update(source.repo.trim()).digest('hex'), 'repo');
+    return path.join(homeDir, '.teamai', 'source-repos', createHash('sha256').update(source.repo.trim()).digest('hex'), 'repo');
   }
 
   describe('pullSources', () => {
@@ -232,6 +232,22 @@ describe('source', () => {
       }
       expect(pullRepo).toHaveBeenCalledTimes(2);
       expect(await fse.pathExists(path.join(sourcesDir, 'shared', 'installed.json'))).toBe(false);
+    });
+
+    it('shares the pull TTL and revision across aliases of the same repository', async () => {
+      const YAML = (await import('yaml')).default;
+      const { pullRepo } = await import('../utils/git.js');
+      vi.mocked(pullRepo).mockClear();
+      const repo = 'https://source.test/shared/repo.git';
+      for (const name of ['first-alias', 'second-alias']) {
+        teamConfig.sources = [{ name, repo }];
+        await fse.writeFile(path.join(localConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(teamConfig));
+        const repoDir = fixtureSourceRepoDir();
+        await fse.outputFile(path.join(repoDir, 'teamai.yaml'), YAML.stringify({ team: 'source', repo }));
+        await pullSources(localConfig, {});
+      }
+      expect(pullRepo).toHaveBeenCalledTimes(1);
+      expect(await fse.readdir(path.join(homeDir, '.teamai', 'source-repos'))).toHaveLength(1);
     });
 
     it('respects a live shared source lock and releases its own lock on success and failure', async () => {
@@ -536,7 +552,7 @@ describe('source', () => {
       if (hasOtherOwner) {
         expect(await fse.readFile(otherManifest, 'utf8')).toBe(original);
         await fse.outputFile(path.join(otherConfig.repo.localPath, 'teamai.yaml'), YAML.stringify({ ...teamConfig, sources: [{ name: 'other-alias', repo }] }));
-        const otherRepo = path.join(sourcesDir, 'other-alias', 'repos', createHash('sha256').update(repo).digest('hex'), 'repo');
+        const otherRepo = path.join(homeDir, '.teamai', 'source-repos', createHash('sha256').update(repo).digest('hex'), 'repo');
         await fse.outputFile(path.join(otherRepo, 'teamai.yaml'), YAML.stringify({ team: 'platform', repo, publicSkills: [] }));
         await pullSources(otherConfig, { force: true });
         expect(await fse.pathExists(target)).toBe(false);
@@ -744,7 +760,7 @@ describe('source', () => {
         expect(await fse.readFile(path.join(homeDir, oldPath, 'SKILL.md'), 'utf8')).toBe('# Original content');
         const otherTeam = { ...teamConfig, sources: [{ name: 'platform', repo: previousUrl }], toolPaths: { claude: { skills: '.claude/skills' } } };
         await fse.outputFile(path.join(otherConfig.repo.localPath, 'teamai.yaml'), YAML.stringify(otherTeam));
-        const otherRepo = path.join(sourcesDir, 'platform', 'repos', previousId, 'repo');
+        const otherRepo = path.join(homeDir, '.teamai', 'source-repos', previousId, 'repo');
         await fse.outputFile(path.join(otherRepo, 'skills/shared-skill/SKILL.md'), '# Original refreshed');
         await fse.outputFile(path.join(otherRepo, 'teamai.yaml'), YAML.stringify({ team: 'platform', repo: previousUrl, publicSkills: ['shared-skill'] }));
         await pullSources(otherConfig, { force: true });
@@ -756,7 +772,7 @@ describe('source', () => {
         await fse.outputFile(path.join(otherConfig.repo.localPath, 'teamai.yaml'), YAML.stringify({
           ...teamConfig, sources: [{ name: 'independent', repo: incomingUrl }], toolPaths: { claude: { skills: '.claude/skills' } },
         }));
-        const incomingRepo = path.join(sourcesDir, 'independent', 'repos', createHash('sha256').update(incomingUrl).digest('hex'), 'repo');
+        const incomingRepo = path.join(homeDir, '.teamai', 'source-repos', createHash('sha256').update(incomingUrl).digest('hex'), 'repo');
         await fse.outputFile(path.join(incomingRepo, 'skills/shared-skill/SKILL.md'), '# Independent source');
         await fse.outputFile(path.join(incomingRepo, 'teamai.yaml'), YAML.stringify({ team: 'independent', repo: incomingUrl, publicSkills: ['shared-skill'] }));
         await pullSources(otherConfig, { force: true });
