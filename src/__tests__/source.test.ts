@@ -28,7 +28,7 @@ vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
 }));
 
-import { deriveSourceName, getSourceManifestPath, getAllSourceSkillNames, getSourceSkillOrigins, pullSources, sourceSyncWarnings } from '../source.js';
+import { deriveSourceName, getSourceManifestPath, getSourcePushQuarantineNames, getSourceSkillOrigins, pullSources, sourceSyncWarnings } from '../source.js';
 import type { TeamaiConfig, LocalConfig, SourceInstallManifest } from '../types.js';
 
 describe('source', () => {
@@ -83,12 +83,12 @@ describe('source', () => {
     });
   });
 
-  describe('getAllSourceSkillNames', () => {
+  describe('getSourcePushQuarantineNames', () => {
     it('quarantines legacy names from push without inventing scoped ownership', async () => {
       await fse.outputJson(path.join(sourcesDir, 'legacy', 'installed.json'), {
         lastPull: new Date().toISOString(), installedSkills: ['local-draft'],
       });
-      expect(await getAllSourceSkillNames(localConfig)).toEqual(new Set(['local-draft']));
+      expect(await getSourcePushQuarantineNames(localConfig)).toEqual(new Set(['local-draft']));
       expect(await getSourceSkillOrigins(localConfig)).toEqual(new Map());
       await fse.outputFile(path.join(homeDir, '.claude/skills/local-draft/SKILL.md'), '# Legacy copy');
       const { getHandler } = await import('../resources/index.js');
@@ -105,7 +105,7 @@ describe('source', () => {
         });
       }
       for (const [index, config] of [localConfig, projectConfig, worktreeConfig, otherTeamConfig].entries()) {
-        expect(await getAllSourceSkillNames(config)).toEqual(new Set([`skill-${index}`]));
+        expect(await getSourcePushQuarantineNames(config)).toEqual(new Set([`skill-${index}`]));
       }
     });
 
@@ -178,7 +178,7 @@ describe('source', () => {
     });
 
     it('should return empty set when no sources exist', async () => {
-      const names = await getAllSourceSkillNames(localConfig);
+      const names = await getSourcePushQuarantineNames(localConfig);
       expect(names.size).toBe(0);
     });
 
@@ -192,7 +192,7 @@ describe('source', () => {
       };
       await fse.outputJson(getSourceManifestPath(path.basename(manifestDir), localConfig), manifest);
 
-      const names = await getAllSourceSkillNames(localConfig);
+      const names = await getSourcePushQuarantineNames(localConfig);
       expect(names.has('skill-a')).toBe(true);
       expect(names.has('skill-b')).toBe(true);
       expect(names.size).toBe(2);
@@ -209,7 +209,7 @@ describe('source', () => {
         await fse.outputJson(getSourceManifestPath(path.basename(manifestDir), localConfig), manifest);
       }
 
-      const names = await getAllSourceSkillNames(localConfig);
+      const names = await getSourcePushQuarantineNames(localConfig);
       expect(names.has('team-a-skill')).toBe(true);
       expect(names.has('team-b-skill')).toBe(true);
       expect(names.size).toBe(2);
@@ -227,7 +227,7 @@ describe('source', () => {
         installedSkills: ['windows-skill'],
       } satisfies SourceInstallManifest);
 
-      const names = await getAllSourceSkillNames(localConfig);
+      const names = await getSourcePushQuarantineNames(localConfig);
       expect(names).toContain('windows-skill');
     });
   });
@@ -310,7 +310,8 @@ describe('source', () => {
       await pullSources(localConfig, { force: true });
       expect(await fse.readFile(target, 'utf8')).toBe('# Preserve team script');
       expect((await fse.readJson(getSourceManifestPath('platform', localConfig))).installedSkills).toEqual([name]);
-      expect(await getAllSourceSkillNames(localConfig)).toContain(name);
+      expect(await getSourcePushQuarantineNames(localConfig)).not.toContain(name);
+      expect((await getSourceSkillOrigins(localConfig)).get(name)).toBe('platform');
       const { getHandler } = await import('../resources/index.js');
       expect((await getHandler('skills').scanLocalForPush(teamConfig, localConfig)).some((item) => item.name === owner)).toBe(false);
     });

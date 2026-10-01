@@ -1078,15 +1078,27 @@ export async function getSourceSkillOrigins(localConfig: LocalConfig): Promise<M
   return origins;
 }
 
-/** Exclude known source skills and quarantine ambiguous legacy names from push. */
-export async function getAllSourceSkillNames(localConfig: LocalConfig): Promise<Set<string>> {
-  const names = new Set((await getSourceSkillOrigins(localConfig)).keys());
+/** Name-only quarantine is reserved for records without complete physical ownership. */
+export async function getSourcePushQuarantineNames(localConfig: LocalConfig): Promise<Set<string>> {
+  const names = new Set<string>();
+  const quarantine = (skill: string) => {
+    names.add(skill);
+    // Recursive push scans identify nested skills by their final component.
+    names.add(path.posix.basename(skill));
+  };
   const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
   for (const sourceName of await listDirs(sourcesDir)) {
+    const scoped = await loadSourceManifest(sourceName, localConfig);
+    for (const skill of scoped?.installedSkills ?? []) {
+      const paths = scoped?.installedPaths?.[skill];
+      const hasPhysicalOwnership = scoped?.destinationRoot && paths?.length
+        && paths.every((target) => scoped.installedPhysicalPaths?.[target]);
+      if (!hasPhysicalOwnership) quarantine(skill);
+    }
     const legacyPath = path.join(getSourceDir(sourceName), 'installed.json');
     const legacy = await readSourceManifest(legacyPath);
     if (!Array.isArray(legacy?.installedSkills) || legacy.installedSkills.length === 0) continue;
-    for (const name of legacy.installedSkills) if (typeof name === 'string') names.add(name);
+    for (const name of legacy.installedSkills) quarantine(name);
     log.warn(`[source:${sourceName}] Legacy tracking has no destination identity. Matching skill names are excluded from push until you review ${legacyPath}.`);
   }
   return names;

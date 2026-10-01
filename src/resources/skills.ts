@@ -557,12 +557,12 @@ export class SkillsHandler extends ResourceHandler {
     const tombstones = await this.readTombstones(localConfig);
     const pushIgnoredSkills = await readPushIgnoredSkills();
 
-    // Load source skill names to exclude from push candidates (Codex finding #1)
+    // Quarantine ambiguous names; modern source records are excluded by physical path.
     let sourceSkillNames: Set<string>;
     let sourcePathOwners: Array<{ path: string; manifestPath?: string }>;
     try {
-      const { getAllSourceSkillNames, getSourcePathOwners } = await import('../source.js');
-      sourceSkillNames = await getAllSourceSkillNames(localConfig);
+      const { getSourcePushQuarantineNames, getSourcePathOwners } = await import('../source.js');
+      sourceSkillNames = await getSourcePushQuarantineNames(localConfig);
       sourcePathOwners = await getSourcePathOwners();
     } catch (error) {
       log.warn(`Skipping skill push because source ownership tracking could not be read safely: ${(error as Error).message}`);
@@ -586,7 +586,7 @@ export class SkillsHandler extends ResourceHandler {
         if (pushIgnoredSkills.has(dir)) continue;
         if (blockedSkills.has(dir)) continue; // Skip skills in non-allowed namespaces
         if (isCliOwnedSkillName(dir)) continue; // Skip CLI built-in skills, current and legacy
-        if (sourceSkillNames.has(dir)) continue; // Skip cross-team source skills
+        if (sourceSkillNames.has(dir)) continue; // Quarantine legacy/unpinned names
         // Compare the file actually scanned, not a future deployment target:
         // recursive scans and Codex's shared directory can differ from that target.
         const physicalPath = resolveReal(localDirPath);
