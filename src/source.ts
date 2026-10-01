@@ -655,13 +655,17 @@ async function pullSingleSource(
   // Load current manifest to determine what to add/remove
   const oldManifest = await loadSourceManifest(source.name, localConfig);
   const oldInstalled = new Set(oldManifest?.installedSkills ?? []);
+  const repositoryId = getSourceRepoId(source);
+  const repositoryChanged = !!oldManifest && oldManifest.repositoryId !== repositoryId;
+  if (repositoryChanged && [...oldInstalled].some((skill) => !oldManifest.installedPaths?.[skill]?.length)) {
+    log.warn(`[source:${source.name}] Cannot replace an installation with unrecorded destinations. Keeping all previous files and provenance unchanged. Manual review is required: review ${getSourceManifestPath(source.name, localConfig)} and the original deployment paths before retiring this claim.`);
+    return;
+  }
   if (oldManifest) await assertSourceDestinationsUnchanged(oldManifest, teamConfig, localConfig, baseDir);
 
   // Collect skills that belong to the local team (they take priority)
   const localTeamSkills = await getLocalTeamSkillNames(teamConfig, localConfig);
   const otherOwners = await getSourcePathOwners(getSourceManifestPath(source.name, localConfig));
-  const repositoryId = getSourceRepoId(source);
-  const repositoryChanged = !!oldManifest && oldManifest.repositoryId !== repositoryId;
 
   // Deploy skills to tool paths
   const deployed: string[] = [];
@@ -834,8 +838,7 @@ async function pullSingleSource(
     for (const oldSkill of oldInstalled) {
       if (retained.has(oldSkill) || isLocalTeamSkill(oldSkill, localTeamSkills)) continue;
       const previousPaths = oldManifest?.installedPaths?.[oldSkill];
-      // An old producer's unrecorded paths cannot be inferred from the new one.
-      if (repositoryChanged && !previousPaths) continue;
+      // Repository replacements with unrecorded claims already stop above.
       await removeSkillFromToolPaths(oldSkill, teamConfig, localConfig, baseDir, [...otherOwners, ...currentOwners], previousPaths, oldManifest?.installedPhysicalPaths);
     }
   }
@@ -1156,12 +1159,29 @@ export async function getSourcePushQuarantineNames(localConfig: LocalConfig): Pr
   };
   const sourcesDir = path.join(getUserHome(), '.teamai', 'sources');
   for (const sourceName of await listDirs(sourcesDir)) {
-    const scoped = await loadSourceManifest(sourceName, localConfig);
-    for (const skill of scoped?.installedSkills ?? []) {
-      const paths = scoped?.installedPaths?.[skill];
-      const hasPhysicalOwnership = scoped?.destinationRoot && paths?.length
-        && paths.every((target) => scoped.installedPhysicalPaths?.[target]);
-      if (!hasPhysicalOwnership) quarantine(skill);
+    const currentPath = getSourceManifestPath(sourceName, localConfig);
+    const quarantineScoped = (scoped: SourceInstallManifest | null, manifestPath: string) => {
+      let ambiguous = false;
+      for (const skill of scoped?.installedSkills ?? []) {
+        const paths = scoped?.installedPaths?.[skill];
+        const hasPhysicalOwnership = scoped?.destinationRoot && paths?.length
+          && paths.every((target) => scoped.installedPhysicalPaths?.[target]);
+        if (!hasPhysicalOwnership) {
+          quarantine(skill);
+          ambiguous = true;
+        }
+      }
+      if (ambiguous) log.warn(`[source:${sourceName}] Scoped tracking has no complete physical ownership. Matching names are excluded from push until you review ${manifestPath}.`);
+    };
+    // Keep the direct read: a malformed current .json path may be a directory,
+    // which file enumeration would omit. Ambiguous foreign claims also apply
+    // when another checkout scans the same HOME; modern pins stay path-specific.
+    quarantineScoped(await loadSourceManifest(sourceName, localConfig), currentPath);
+    const installationsDir = path.join(getSourceDir(sourceName), 'installations');
+    for (const file of await listFiles(installationsDir)) {
+      const manifestPath = path.join(installationsDir, file);
+      if (manifestPath === currentPath || !file.endsWith('.json')) continue;
+      quarantineScoped(await readSourceManifest(manifestPath), manifestPath);
     }
     const legacyPath = path.join(getSourceDir(sourceName), 'installed.json');
     const legacy = await readSourceManifest(legacyPath);

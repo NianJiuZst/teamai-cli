@@ -105,7 +105,7 @@ describe('source', () => {
         });
       }
       for (const [index, config] of [localConfig, projectConfig, worktreeConfig, otherTeamConfig].entries()) {
-        expect(await getSourcePushQuarantineNames(config)).toEqual(new Set([`skill-${index}`]));
+        expect(new Set((await getSourceSkillOrigins(config)).keys())).toEqual(new Set([`skill-${index}`]));
       }
     });
 
@@ -120,6 +120,7 @@ describe('source', () => {
       await fse.outputJson(getSourceManifestPath('foreign-source', otherConfig), {
         destinationRoot: otherRoot, lastPull: new Date(0).toISOString(),
         installedSkills: ['third-party'], installedPaths: { 'third-party': ['.claude/skills/third-party'] },
+        installedPhysicalPaths: { '.claude/skills/third-party': path.join(destination === 'symlink' ? homeDir : otherRoot, '.claude/skills/third-party') },
       } satisfies SourceInstallManifest);
       const { getHandler } = await import('../resources/index.js');
       const candidates = await getHandler('skills').scanLocalForPush(teamConfig, localConfig);
@@ -170,6 +171,7 @@ describe('source', () => {
       await fse.outputJson(getSourceManifestPath('foreign', otherConfig), {
         destinationRoot: homeDir, lastPull: new Date(0).toISOString(),
         installedSkills: ['third-party'], installedPaths: { 'third-party': [ownedPath] },
+        installedPhysicalPaths: { [ownedPath]: path.join(homeDir, ownedPath) },
       } satisfies SourceInstallManifest);
       const { getHandler } = await import('../resources/index.js');
       const names = (await getHandler('skills').scanLocalForPush(teamConfig, localConfig)).map((item) => item.name);
