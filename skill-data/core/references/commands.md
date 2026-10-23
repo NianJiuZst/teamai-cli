@@ -394,7 +394,7 @@ Generated: do not edit by hand. Regenerate with
     - `--update-quality` — Find stale docs/rules/skills and suggest updates
     - `--dry-run` — Show what would be done without making changes
   - `teamai recall promote [learningId]` — Promote a high-confidence learning to formal knowledge (docs/skills/rules)
-    - `--category <cat>` — Target category: skills | rules | docs
+    - `--category <cat>` — Target category: skills | rules | docs; skills use <learningId>/SKILL.md
     - `--dry-run` — Show what would be done without making changes
 
 ## import

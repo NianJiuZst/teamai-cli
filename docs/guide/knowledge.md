@@ -105,6 +105,8 @@ Confidence is an activity score from 0 to 1, not a probability that the knowledg
 
 A learning can become a skill, rule, or doc when its confidence is at least 0.90, it has at least 5 upvotes, at least 2 contributors, and it has existed for at least 14 days.
 
+Promoted skills use `skills/<learningId>/SKILL.md`, with missing `name` and `description` frontmatter filled in so tools can discover them. Rules and docs remain Markdown files in their respective directories.
+
 ```bash
 teamai recall promote
 teamai recall promote <learningId> --category skills

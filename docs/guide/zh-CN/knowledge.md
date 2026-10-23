@@ -105,6 +105,8 @@ teamai recall maintenance --update-quality
 
 置信度至少 0.90、至少 5 次 upvote、至少 2 个贡献者、存在至少 14 天，可以升成 skill、rule 或 doc。
 
+晋升后的 skill 位于 `skills/<learningId>/SKILL.md`，缺少的 `name` 和 `description` 前置信息会自动补齐，便于工具识别。rule 和 doc 仍是各自目录下的 Markdown 文件。
+
 ```bash
 teamai recall promote
 teamai recall promote <learningId> --category skills

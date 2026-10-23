@@ -1567,7 +1567,7 @@ recallCmd
 recallCmd
   .command('promote [learningId]')
   .description('Promote a high-confidence learning to formal knowledge (docs/skills/rules)')
-  .option('--category <cat>', 'Target category: skills | rules | docs')
+  .option('--category <cat>', 'Target category: skills | rules | docs; skills use <learningId>/SKILL.md')
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (learningId, localOpts) => {
     // As in `recall maintenance`: `--dry-run` reaches the root's options only (#900).
