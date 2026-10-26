@@ -33,13 +33,15 @@ const MIN_AGE_DAYS = 14;
 
 /**
  * Find learnings eligible for promotion to formal knowledge. A learning marked
- * `promoted_to` stays out only while that target is in place in `knowledgeDir`,
- * so one whose review was closed unmerged and its branch deleted is offered again.
+ * `promoted_to` stays out only while that target is in place in
+ * `knowledgeCheckout`, the git checkout of the team's knowledge, so one whose
+ * review was closed unmerged and its branch deleted is offered again. Without
+ * a checkout, the marker alone keeps it out.
  */
 export async function findPromotionCandidates(
   learningsDirs: readonly string[],
   votesDir: string,
-  knowledgeDir: string,
+  knowledgeCheckout: string | undefined,
 ): Promise<PromotionCandidate[]> {
   const confidenceMap = await computeAllConfidence(votesDir);
   const eligible: Array<Omit<PromotionCandidate, 'suggestedCategory'> & { content: string; promotedTo?: string }> = [];
@@ -91,7 +93,7 @@ export async function findPromotionCandidates(
     });
   }
 
-  const inPlace = await promotionTargetsInPlace(knowledgeDir, eligible.flatMap((entry) => entry.promotedTo ?? []));
+  const inPlace = await promotionTargetsInPlace(knowledgeCheckout, eligible.flatMap((entry) => entry.promotedTo ?? []));
   const candidates: PromotionCandidate[] = [];
   for (const { content, promotedTo, ...entry } of eligible) {
     if (promotedTo !== undefined && inPlace.has(promotedTo)) continue;
@@ -102,13 +104,13 @@ export async function findPromotionCandidates(
 }
 
 /**
- * Update origin's default branch and its review branches in the checkout at
- * `knowledgeDir`, dropping the review branches origin no longer has, so
+ * Update origin's default branch and its review branches in `knowledgeCheckout`,
+ * dropping the review branches origin no longer has, so
  * {@link findPromotionCandidates} sees the promotions as origin has them.
  */
-export async function fetchPromotionRefs(knowledgeDir: string): Promise<void> {
-  const branch = await getDefaultBranch(knowledgeDir);
-  await createGit(knowledgeDir).fetch([
+export async function fetchPromotionRefs(knowledgeCheckout: string): Promise<void> {
+  const branch = await getDefaultBranch(knowledgeCheckout);
+  await createGit(knowledgeCheckout).fetch([
     '--prune',
     'origin',
     `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
@@ -117,15 +119,15 @@ export async function fetchPromotionRefs(knowledgeDir: string): Promise<void> {
 }
 
 /**
- * The targets, relative to `knowledgeDir`, that origin's default branch has or
- * a review branch adds, as of the last fetch. Every target when git cannot
- * tell, as for a directory that is no checkout of origin.
+ * The targets, relative to `knowledgeCheckout`, that origin's default branch
+ * has or a review branch adds, as of the last fetch. Every target when there
+ * is no checkout or git cannot tell.
  */
-async function promotionTargetsInPlace(knowledgeDir: string, targets: readonly string[]): Promise<ReadonlySet<string>> {
-  if (targets.length === 0) return new Set();
+async function promotionTargetsInPlace(knowledgeCheckout: string | undefined, targets: readonly string[]): Promise<ReadonlySet<string>> {
+  if (knowledgeCheckout === undefined || targets.length === 0) return new Set(targets);
   try {
-    const git = createGit(knowledgeDir);
-    const base = `origin/${await getDefaultBranch(knowledgeDir)}`;
+    const git = createGit(knowledgeCheckout);
+    const base = `origin/${await getDefaultBranch(knowledgeCheckout)}`;
     const onBase = await git.raw(['--literal-pathspecs', 'ls-tree', '-z', '--name-only', base, '--', ...targets]);
     const onReview = await git.raw([
       '--literal-pathspecs', 'log', '-z', '--relative', '--name-only', '--format=',
@@ -133,7 +135,7 @@ async function promotionTargetsInPlace(knowledgeDir: string, targets: readonly s
     ]);
     return new Set(`${onBase}\0${onReview}`.split('\0').filter(Boolean));
   } catch (e) {
-    log.debug(`Could not read promotion targets in ${knowledgeDir}; treating marked learnings as promoted: ${e instanceof Error ? e.message : String(e)}`);
+    log.debug(`Could not read promotion targets in ${knowledgeCheckout}; treating marked learnings as promoted: ${e instanceof Error ? e.message : String(e)}`);
     return new Set(targets);
   }
 }

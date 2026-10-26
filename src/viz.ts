@@ -460,7 +460,8 @@ export async function buildVizData(paths: VizPaths): Promise<VizData> {
   const authors = buildAuthors(metrics);
 
   const [promote, prune, stale] = await Promise.all([
-    findPromotionCandidates(paths.learningsDirs, paths.votesDir, paths.knowledgeRoot).catch((err: Error) => {
+    // knowledgeRoot may be a --repo path or ~/.teamai, so the marker alone keeps a learning out.
+    findPromotionCandidates(paths.learningsDirs, paths.votesDir, undefined).catch((err: Error) => {
       console.warn(`Warning: could not load promotion candidates: ${err.message}`);
       return [] as PromotionCandidate[];
     }),

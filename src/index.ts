@@ -1656,12 +1656,15 @@ recallCmd
     } = paths;
     const { log } = await import('./utils/logger.js');
 
-    if (!cmdOpts.dryRun) {
-      await fetchPromotionRefs(repoPath).catch((e: unknown) => {
+    // An HTTP team repo has no git checkout: its directory may sit in the business repo.
+    const { usesBranchWorktree } = await import('./types.js');
+    const knowledgeCheckout = usesBranchWorktree(localConfig) ? repoPath : undefined;
+    if (knowledgeCheckout && !cmdOpts.dryRun) {
+      await fetchPromotionRefs(knowledgeCheckout).catch((e: unknown) => {
         log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${e instanceof Error ? e.message : String(e)}`);
       });
     }
-    const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, repoPath);
+    const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, knowledgeCheckout);
 
     if (candidates.length === 0) {
       log.info('No learnings eligible for promotion yet.');
