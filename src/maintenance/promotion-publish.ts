@@ -44,10 +44,10 @@ export async function promoteAndPublish(
           const relativePath = path.relative(repoPath, targetPath).split(path.sep).join('/');
           const branch = await unusedBranchName(repoPath, localConfig.username);
           const git = createGit(repoPath);
-          await git.checkoutLocalBranch(branch);
           await git.raw(['--literal-pathspecs', 'add', '--', relativePath]);
           await commitSkippingHooks(git, message);
-          await git.push(['-u', 'origin', branch]);
+          // Push from the detached worktree: a local branch would outlive it in the member's checkout.
+          await git.push(['origin', `HEAD:refs/heads/${branch}`]);
           log.success(`Promotion artifact pushed to branch ${branch}`);
           if (getProvider(localConfig.provider ?? teamConfig.provider).name === 'git') {
             log.info(`Create a pull/merge request for ${branch} to review the promoted knowledge.`);

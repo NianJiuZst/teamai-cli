@@ -173,7 +173,7 @@ export async function executePromotion(
   const targetPath = path.join(repoPath, relativePath);
   assertSafePath(targetPath, [repoPath]);
   if (await pathExists(targetPath)) {
-    throw new Error(`Promotion target already exists: ${targetPath}. Nothing was overwritten.`);
+    throw new Error(`Promotion target already exists: ${relativePath}. Nothing was overwritten.`);
   }
 
   if (options.dryRun) {
