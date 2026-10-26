@@ -117,7 +117,7 @@ teamai recall promote <learningId> --category skills
 teamai recall promote <learningId> --dry-run
 ```
 
-晋升会把新条目推送到评审分支，并在 provider 支持时创建 PR/MR。使用 `git` provider 时，请根据输出的分支名自行发起评审。只有条目推送成功后才会标记 learning 已晋升；合并评审后，其他成员才能 pull 到它。推送失败时，learning 仍可重试晋升。已有的目标文件不会被覆盖，`--category` 只接受 `skills`、`rules` 或 `docs`。
+晋升会把新条目推送到评审分支，并在 provider 支持时创建 PR/MR。使用 `git` provider 时，请根据输出的分支名自行发起评审。只有条目推送成功后才会标记 learning 已晋升；合并评审后，其他成员才能 pull 到它。推送失败时，learning 仍可重试晋升。评审未合并就关闭时，删除它的分支，learning 会重新成为晋升候选。已有的目标文件不会被覆盖，`--category` 只接受 `skills`、`rules` 或 `docs`。
 
 ## 代码知识图谱
 

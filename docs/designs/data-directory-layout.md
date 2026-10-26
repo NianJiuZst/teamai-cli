@@ -922,6 +922,11 @@ index and working files are left alone. The artifact push must succeed before
 the existing learnings maintenance journal, so a failed marker push can retry on
 the next pull without generating the knowledge entry again. A failed artifact
 push leaves the learning eligible. Existing targets are refused, never replaced.
+The marker keeps the learning out of the candidates only while its target is on
+origin's default branch or added by a `teamai/push/*` review branch.
+`recall promote` fetches both first and prunes the review branches origin
+deleted, so a review closed unmerged, once its branch is deleted, offers the
+learning again. Promoting it again replaces the marker.
 
 Those builds, and the reports checkout `teamai recall feedback --negative` counts
 the team's upvotes from, take the votes directory from `indexableVotesDir`,

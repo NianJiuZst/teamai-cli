@@ -117,7 +117,7 @@ teamai recall promote <learningId> --category skills
 teamai recall promote <learningId> --dry-run
 ```
 
-Promotion pushes the new entry to a review branch and opens a PR/MR when the provider supports it. With the `git` provider, open the review request yourself using the printed branch name. The learning is marked as promoted only after the entry is pushed; merge the review request before teammates pull it. If the push fails, the learning stays eligible for retry. Existing target files are never overwritten, and `--category` accepts only `skills`, `rules`, or `docs`.
+Promotion pushes the new entry to a review branch and opens a PR/MR when the provider supports it. With the `git` provider, open the review request yourself using the printed branch name. The learning is marked as promoted only after the entry is pushed; merge the review request before teammates pull it. If the push fails, the learning stays eligible for retry. If a review request is closed without merging, delete its branch and the learning is offered for promotion again. Existing target files are never overwritten, and `--category` accepts only `skills`, `rules`, or `docs`.
 
 ## Codebase Knowledge Graph
 
