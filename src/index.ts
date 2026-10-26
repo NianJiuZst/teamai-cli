@@ -1663,8 +1663,8 @@ recallCmd
     if (knowledgeCheckout && !cmdOpts.dryRun) {
       // A fetch beside a pull in the same clone pushes the pull into its reset fallback.
       const { withFileLock } = await import('./update.js');
-      const lock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
       try {
+        const lock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
         const fetched = await withFileLock(lock, { attempts: 1, delayMs: 0 }, () => fetchPromotionRefs(knowledgeCheckout));
         if (!fetched.held) log.warn('Another teamai pull/push is in progress, so candidates follow the last fetch of the review branches.');
       } catch (e) {
