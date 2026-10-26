@@ -11,7 +11,7 @@ import { createPrWithFallback } from '../push.js';
 import { getProvider } from '../providers/index.js';
 import { log } from '../utils/logger.js';
 import { resolveMaintenancePaths } from './paths.js';
-import { executePromotion, findPromotionCandidates, type PromoteOptions } from './promote.js';
+import { executePromotion, fetchPromotionRefs, findPromotionCandidates, type PromoteOptions } from './promote.js';
 
 /** Publish one new knowledge artifact, then its learning marker, without changing the active checkout. */
 export async function promoteAndPublish(
@@ -29,8 +29,9 @@ export async function promoteAndPublish(
     throw new Error('Another teamai pull/push/migration is in progress. Retry promotion once it finishes.');
   }
   try {
-    const { votesDir, learningsReadDirs, learningsWriteDir } = await resolveMaintenancePaths(localConfig);
-    const candidates = await findPromotionCandidates(learningsReadDirs, votesDir);
+    const { repoPath: knowledgeDir, votesDir, learningsReadDirs, learningsWriteDir } = await resolveMaintenancePaths(localConfig);
+    await fetchPromotionRefs(knowledgeDir);
+    const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, knowledgeDir);
     const candidate = candidates.find((entry) => entry.docId === learningId);
     if (!candidate) throw new Error(`Learning "${learningId}" not found or not eligible for promotion.`);
 

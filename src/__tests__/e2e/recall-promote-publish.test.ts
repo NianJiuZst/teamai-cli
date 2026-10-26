@@ -128,4 +128,29 @@ describe('recall promote publishes the artifact before the marker', () => {
     expect(git(['show', 'teamai-learnings:learnings/ready.md'])).toContain('promoted_to: docs/ready.md');
     expect(localPushBranches()).toBe('');
   });
+
+  it('keeps the learning out of the candidates while its review branch is open', () => {
+    expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
+
+    expect(cli(['recall', 'promote']).output).not.toContain('- ready');
+  });
+
+  it('keeps the learning out once its review is merged and the branch deleted', () => {
+    expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
+    const branch = remotePushBranches();
+    git(['update-ref', 'refs/heads/main', branch]);
+    git(['branch', '-D', branch]);
+
+    expect(cli(['recall', 'promote']).output).not.toContain('- ready');
+  });
+
+  it('offers the learning again once its review branch is deleted unmerged', () => {
+    expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
+    git(['branch', '-D', remotePushBranches()]);
+
+    expect(cli(['recall', 'promote']).output).toContain('- ready');
+    const again = cli(['recall', 'promote', 'ready', '--category', 'rules']);
+    expect(again.code, again.output).toBe(0);
+    expect(git(['show', 'teamai-learnings:learnings/ready.md'])).toContain('promoted_to: rules/ready.md');
+  });
 });

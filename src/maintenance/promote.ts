@@ -5,6 +5,7 @@ import { writeFile as writeNewFile } from 'node:fs/promises';
 import matter from 'gray-matter';
 import { readFileSafe, writeFile, listFiles, ensureDir, pathExists } from '../utils/fs.js';
 import { assertSafePath } from '../utils/path-safety.js';
+import { createGit, getDefaultBranch, PUSH_BRANCH_PREFIX } from '../utils/git.js';
 import { isInWriteRoot, listLearningFiles } from '../utils/learnings-roots.js';
 import { log } from '../utils/logger.js';
 import { computeAllConfidence } from './confidence.js';
@@ -31,14 +32,17 @@ const MIN_USERS = 2;
 const MIN_AGE_DAYS = 14;
 
 /**
- * Find learnings eligible for promotion to formal knowledge.
+ * Find learnings eligible for promotion to formal knowledge. A learning marked
+ * `promoted_to` stays out only while that target is in place in `knowledgeDir`,
+ * so one whose review was closed unmerged and its branch deleted is offered again.
  */
 export async function findPromotionCandidates(
   learningsDirs: readonly string[],
   votesDir: string,
+  knowledgeDir: string,
 ): Promise<PromotionCandidate[]> {
   const confidenceMap = await computeAllConfidence(votesDir);
-  const candidates: PromotionCandidate[] = [];
+  const eligible: Array<Omit<PromotionCandidate, 'suggestedCategory'> & { content: string; promotedTo?: string }> = [];
 
   const perDoc = await aggregatePerDocVotes(votesDir);
   const files = await listLearningFiles(learningsDirs);
@@ -59,11 +63,12 @@ export async function findPromotionCandidates(
 
     let title = docId;
     let date = '';
+    let promotedTo: string | undefined;
     try {
       const { data } = matter(content);
       title = typeof data.title === 'string' ? data.title : docId;
       date = typeof data.date === 'string' ? data.date : '';
-      if (data.promoted_to) continue;
+      promotedTo = typeof data.promoted_to === 'string' ? data.promoted_to : undefined;
     } catch {
       continue;
     }
@@ -73,9 +78,7 @@ export async function findPromotionCandidates(
       if (ageInDays < MIN_AGE_DAYS) continue;
     }
 
-    const suggestedCategory = await inferCategory(content, title);
-
-    candidates.push({
+    eligible.push({
       docId,
       filename: file,
       path: absPath,
@@ -83,11 +86,56 @@ export async function findPromotionCandidates(
       upvotedCount: docVotes.upvoted,
       userCount: docVotes.users.size,
       title,
-      suggestedCategory,
+      content,
+      promotedTo,
     });
   }
 
+  const inPlace = await promotionTargetsInPlace(knowledgeDir, eligible.flatMap((entry) => entry.promotedTo ?? []));
+  const candidates: PromotionCandidate[] = [];
+  for (const { content, promotedTo, ...entry } of eligible) {
+    if (promotedTo !== undefined && inPlace.has(promotedTo)) continue;
+    candidates.push({ ...entry, suggestedCategory: await inferCategory(content, entry.title) });
+  }
+
   return candidates.sort((a, b) => b.confidence - a.confidence);
+}
+
+/**
+ * Update origin's default branch and its review branches in the checkout at
+ * `knowledgeDir`, dropping the review branches origin no longer has, so
+ * {@link findPromotionCandidates} sees the promotions as origin has them.
+ */
+export async function fetchPromotionRefs(knowledgeDir: string): Promise<void> {
+  const branch = await getDefaultBranch(knowledgeDir);
+  await createGit(knowledgeDir).fetch([
+    '--prune',
+    'origin',
+    `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+    `+refs/heads/${PUSH_BRANCH_PREFIX}*:refs/remotes/origin/${PUSH_BRANCH_PREFIX}*`,
+  ]);
+}
+
+/**
+ * The targets, relative to `knowledgeDir`, that origin's default branch has or
+ * a review branch adds, as of the last fetch. Every target when git cannot
+ * tell, as for a directory that is no checkout of origin.
+ */
+async function promotionTargetsInPlace(knowledgeDir: string, targets: readonly string[]): Promise<ReadonlySet<string>> {
+  if (targets.length === 0) return new Set();
+  try {
+    const git = createGit(knowledgeDir);
+    const base = `origin/${await getDefaultBranch(knowledgeDir)}`;
+    const onBase = await git.raw(['--literal-pathspecs', 'ls-tree', '-z', '--name-only', base, '--', ...targets]);
+    const onReview = await git.raw([
+      '--literal-pathspecs', 'log', '-z', '--relative', '--name-only', '--format=',
+      `--remotes=origin/${PUSH_BRANCH_PREFIX}*`, `^${base}`, '--', ...targets,
+    ]);
+    return new Set(`${onBase}\0${onReview}`.split('\0').filter(Boolean));
+  } catch (e) {
+    log.debug(`Could not read promotion targets in ${knowledgeDir}; treating marked learnings as promoted: ${e instanceof Error ? e.message : String(e)}`);
+    return new Set(targets);
+  }
 }
 
 /**

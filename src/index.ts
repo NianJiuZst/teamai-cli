@@ -1647,6 +1647,7 @@ recallCmd
     const {
       findPromotionCandidates,
       executePromotion,
+      fetchPromotionRefs,
     } = await import('./maintenance/index.js');
     const paths = await maintenancePathsOrExit(localConfig, cmdOpts.dryRun);
     if (!paths) return;
@@ -1655,7 +1656,12 @@ recallCmd
     } = paths;
     const { log } = await import('./utils/logger.js');
 
-    const candidates = await findPromotionCandidates(learningsReadDirs, votesDir);
+    if (!cmdOpts.dryRun) {
+      await fetchPromotionRefs(repoPath).catch((e: unknown) => {
+        log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    }
+    const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, repoPath);
 
     if (candidates.length === 0) {
       log.info('No learnings eligible for promotion yet.');
