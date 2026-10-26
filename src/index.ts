@@ -1,5 +1,4 @@
 import { createRequire } from 'node:module';
-import path from 'node:path';
 import { Command, Option } from 'commander';
 import { setVerbose, setSilent, log } from './utils/logger.js';
 import { applyNonInteractiveGitEnv } from './utils/git-env.js';
@@ -1557,7 +1556,7 @@ recallCmd
 
     const { autoDetectInit } = await import('./config.js');
     const { localConfig } = await autoDetectInit(undefined, { dryRun: cmdOpts.dryRun });
-    const paths = await maintenancePathsOrExit(localConfig, cmdOpts.dryRun);
+    const paths = await maintenancePathsOrExit(localConfig, { dryRun: cmdOpts.dryRun });
     if (!paths) return;
     const {
       repoPath, votesDir, learningsReadDirs, learningsWriteDir,
@@ -1650,27 +1649,44 @@ recallCmd
       executePromotion,
       fetchPromotionRefs,
     } = await import('./maintenance/index.js');
-    const paths = await maintenancePathsOrExit(localConfig, cmdOpts.dryRun);
+    const { log } = await import('./utils/logger.js');
+
+    // An HTTP team repo has no git checkout: its directory may sit in the business repo.
+    const { usesBranchWorktree, getKnowledgeDir } = await import('./types.js');
+    const knowledgeCheckout = usesBranchWorktree(localConfig) ? getKnowledgeDir(localConfig) : undefined;
+    let paths: MaintenancePaths | undefined;
+    if (knowledgeCheckout && !cmdOpts.dryRun) {
+      // A fetch beside a pull in the same clone pushes the pull into its reset
+      // fallback, so the checkouts and the review branches share one hold of the sync lock.
+      const refreshForListing = async () => {
+        const refreshed = await maintenancePathsOrExit(localConfig, { holdsSyncLock: true });
+        if (refreshed) {
+          await fetchPromotionRefs(knowledgeCheckout).catch((e: unknown) => {
+            log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${e instanceof Error ? e.message : String(e)}`);
+          });
+        }
+        return refreshed;
+      };
+      const { syncLockPath } = await import('./utils/learnings-publish.js');
+      const { withFileLock } = await import('./update.js');
+      const lock = syncLockPath(localConfig);
+      const listed = lock === null
+        ? { held: true as const, value: await refreshForListing() }
+        : await withFileLock(lock, { attempts: 1, delayMs: 0 }, refreshForListing);
+      if (listed.held) {
+        paths = listed.value;
+      } else {
+        log.warn('Another teamai pull/push is in progress, so candidates follow the last fetch.');
+        // As a dry run does: both checkouts as they are, neither refreshed nor created.
+        paths = await maintenancePathsOrExit(localConfig, { dryRun: true });
+      }
+    } else {
+      paths = await maintenancePathsOrExit(localConfig, { dryRun: cmdOpts.dryRun });
+    }
     if (!paths) return;
     const {
       repoPath, votesDir, learningsReadDirs, learningsWriteDir,
     } = paths;
-    const { log } = await import('./utils/logger.js');
-
-    // An HTTP team repo has no git checkout: its directory may sit in the business repo.
-    const { usesBranchWorktree, getDataHome, SYNC_LOCK_FILENAME } = await import('./types.js');
-    const knowledgeCheckout = usesBranchWorktree(localConfig) ? repoPath : undefined;
-    if (knowledgeCheckout && !cmdOpts.dryRun) {
-      // A fetch beside a pull in the same clone pushes the pull into its reset fallback.
-      const { withFileLock } = await import('./update.js');
-      try {
-        const lock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
-        const fetched = await withFileLock(lock, { attempts: 1, delayMs: 0 }, () => fetchPromotionRefs(knowledgeCheckout));
-        if (!fetched.held) log.warn('Another teamai pull/push is in progress, so candidates follow the last fetch of the review branches.');
-      } catch (e) {
-        log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
     const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, knowledgeCheckout);
 
     if (candidates.length === 0) {
@@ -1707,15 +1723,19 @@ recallCmd
  * maintenance would rewrite, or an old one in the way of the shared checkout it
  * would write into, which the next publish would then delete. The refusal names
  * the checkout and the way out, and has already been printed. Also when the
- * reports or learnings lock cannot be taken, so the checkout cannot be checked.
+ * reports or learnings lock cannot be taken, so the checkout cannot be checked,
+ * and while a pull/push holds the sync lock, so neither is refreshed.
  */
-async function maintenancePathsOrExit(localConfig: LocalConfig, dryRun?: boolean): Promise<MaintenancePaths | undefined> {
-  const { CheckoutLockedError, CheckoutUnavailableError, resolveMaintenancePaths } = await import('./maintenance/index.js');
+async function maintenancePathsOrExit(
+  localConfig: LocalConfig,
+  options: { dryRun?: boolean; holdsSyncLock?: boolean },
+): Promise<MaintenancePaths | undefined> {
+  const { CheckoutLockedError, CheckoutUnavailableError, SyncLockedError, resolveMaintenancePaths } = await import('./maintenance/index.js');
   const { CheckoutRefusedError } = await import('./utils/branch-worktree.js');
   try {
-    return await resolveMaintenancePaths(localConfig, { dryRun });
+    return await resolveMaintenancePaths(localConfig, options);
   } catch (e) {
-    if (e instanceof CheckoutLockedError || e instanceof CheckoutUnavailableError) {
+    if (e instanceof CheckoutLockedError || e instanceof CheckoutUnavailableError || e instanceof SyncLockedError) {
       const { log } = await import('./utils/logger.js');
       log.error(e.message);
     } else if (!(e instanceof CheckoutRefusedError)) {

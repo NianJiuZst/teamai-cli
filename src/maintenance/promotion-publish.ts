@@ -29,7 +29,7 @@ export async function promoteAndPublish(
     throw new Error('Another teamai pull/push/migration is in progress. Retry promotion once it finishes.');
   }
   try {
-    const { repoPath: knowledgeCheckout, votesDir, learningsReadDirs, learningsWriteDir } = await resolveMaintenancePaths(localConfig);
+    const { repoPath: knowledgeCheckout, votesDir, learningsReadDirs, learningsWriteDir } = await resolveMaintenancePaths(localConfig, { holdsSyncLock: true });
     await fetchPromotionRefs(knowledgeCheckout);
     const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, knowledgeCheckout);
     const candidate = candidates.find((entry) => entry.docId === learningId);

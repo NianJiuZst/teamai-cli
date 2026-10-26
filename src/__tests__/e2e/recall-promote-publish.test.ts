@@ -73,6 +73,25 @@ describe('recall promote publishes the artifact before the marker', () => {
   const git = (args: string[], cwd = remote) => execFileSync('git', args, { cwd, encoding: 'utf8' });
   const localPushBranches = () => git(['branch', '--list', 'teamai/push/*'], path.join(home, '.teamai', 'team-repo'));
   const remotePushBranches = () => git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/push/']).trim();
+  const fetchedLearnings = () => git(['rev-parse', 'refs/remotes/origin/teamai-learnings'], path.join(home, '.teamai', 'team-repo')).trim();
+
+  /** A live process other than the CLI holds the sync lock, as a running `teamai pull` does. */
+  function holdSyncLock() {
+    fs.writeFileSync(
+      path.join(home, '.teamai', '.sync-lock'),
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'another-pull' }),
+    );
+  }
+
+  function publishTeammateLearning() {
+    const work = path.join(sandbox, 'teammate');
+    const env = { ...process.env, ...GIT_ENV };
+    execFileSync('git', ['clone', '-q', '-b', 'teamai-learnings', remote, work], { env });
+    fs.writeFileSync(path.join(work, 'learnings', 'later.md'), '---\ntitle: later\n---\nA teammate learned this.\n');
+    execFileSync('git', ['add', '-A'], { cwd: work, env });
+    execFileSync('git', ['commit', '-qm', 'later'], { cwd: work, env });
+    execFileSync('git', ['push', '-q', 'origin', 'teamai-learnings'], { cwd: work, env });
+  }
 
   beforeAll(() => {
     if (!fs.existsSync(CLI)) throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
@@ -215,15 +234,40 @@ describe('recall promote publishes the artifact before the marker', () => {
   it('lists from the last fetch while another sync holds the lock', () => {
     expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
     git(['branch', '-D', remotePushBranches()]);
-    fs.writeFileSync(
-      path.join(home, '.teamai', '.sync-lock'),
-      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'another-pull' }),
-    );
+    holdSyncLock();
 
     const listing = cli(['recall', 'promote']);
 
     expect(listing.code, listing.output).toBe(0);
     expect(listing.output).toContain('Another teamai pull/push is in progress');
     expect(listing.output).not.toContain('- ready');
+  });
+
+  it('lists from the learnings as last fetched while another sync holds the lock', () => {
+    expect(cli(['recall', 'promote']).output).toContain('- ready');
+    const fetched = fetchedLearnings();
+    publishTeammateLearning();
+    holdSyncLock();
+
+    const listing = cli(['recall', 'promote']);
+
+    expect(listing.code, listing.output).toBe(0);
+    expect(listing.output).toContain('Another teamai pull/push is in progress');
+    expect(listing.output).toContain('- ready');
+    expect(fetchedLearnings()).toBe(fetched);
+  });
+
+  it('stops recall maintenance before it fetches while another sync holds the lock', () => {
+    expect(cli(['recall', 'promote']).output).toContain('- ready');
+    const fetched = fetchedLearnings();
+    publishTeammateLearning();
+    holdSyncLock();
+
+    const maintenance = cli(['recall', 'maintenance', '--confidence-writeback']);
+
+    expect(maintenance.code, maintenance.output).toBe(1);
+    expect(maintenance.output).toContain('Another teamai pull/push is in progress');
+    expect(fetchedLearnings()).toBe(fetched);
+    expect(git(['show', 'teamai-learnings:learnings/ready.md'])).not.toContain('confidence');
   });
 });

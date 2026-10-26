@@ -7,5 +7,5 @@ export { findStaleEntries, reportStaleEntries, findRelatedAdoptedLearnings, gene
 export type { StaleEntry, QualityUpdateOptions } from './quality-update.js';
 export { findPromotionCandidates, executePromotion, fetchPromotionRefs } from './promote.js';
 export type { PromotionCandidate, PromoteOptions } from './promote.js';
-export { CheckoutLockedError, CheckoutUnavailableError, resolveMaintenancePaths } from './paths.js';
+export { CheckoutLockedError, CheckoutUnavailableError, SyncLockedError, resolveMaintenancePaths } from './paths.js';
 export type { MaintenancePaths } from './paths.js';
