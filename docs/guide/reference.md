@@ -56,6 +56,7 @@ sharing:
         secret: my-signing-key
         timeout: 5000
         retries: 3
+
 ```
 
 ### config.yaml (local config)
@@ -74,6 +75,8 @@ gitExcludeEnabled: true
 contributeHintEnabled: false
 usageReportEnabled: false
 codexTrustEnabled: false
+scoring:
+  isolation: verified          # this scope's judges must be verified; the strictest of team, scorer and this wins
 toolRoots:
   claude: ~/.claude-work
   codex: ~/.codex-alt
@@ -99,7 +102,7 @@ Cursor CLI moves two directories: `CURSOR_DATA_DIR` holds the transcripts, `CURS
 
 #### Recorded tool homes (`~/.teamai/tool-homes.json`)
 
-Some tools move their home with a variable: `XDG_CONFIG_HOME` (OpenCode, Muse), `OPENCODE_CONFIG_DIR`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CODEBUDDY_CONFIG_DIR`, `COPILOT_HOME`, `DSH_HOME`, `OPENCLAW_STATE_DIR` and `OPENCLAW_PROFILE`. On Windows, Hermes lives in `%LOCALAPPDATA%\hermes`. A relative value of a tool's own variable resolves against the directory you run teamai from, as the tool resolves it; a relative `XDG_CONFIG_HOME` or `%LOCALAPPDATA%` is ignored. teamai syncs to the moved home. For OpenCode, Muse, Pi and CodeBuddy only part of it follows so far. With `XDG_CONFIG_HOME=/x`, OpenCode's skills, agents, rules at `/x/opencode/rules`, instruction blocks at `/x/opencode/teamai-context.md`, and the `opencode.json` that MCP and `teamai models switch` write go to `/x/opencode`. Muse's skills and agents go to `/x/muse`, its MCP config goes to `/x/muse`, and its user rules and instruction blocks are `/x/muse/AGENTS.md`. Their hooks and other settings stay under `~/.config/opencode` and `~/.config/muse`. With `PI_CODING_AGENT_DIR=/x`, Pi's skills, MCP config and `models.json` go to `/x`, and its user rules and instruction blocks are `/x/AGENTS.md`, while its extension stays under `~/.pi/agent`. With `CODEBUDDY_CONFIG_DIR=/x`, CodeBuddy's skills, rules, agents, `CODEBUDDY.md` and MCP files go to `/x`, `.codebuddy.json` included, while its hooks stay in `~/.codebuddy/settings.json`. `teamai doctor` notes it.
+Some tools move their home with a variable: `XDG_CONFIG_HOME` (OpenCode, Muse), `OPENCODE_CONFIG_DIR`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `CODEBUDDY_CONFIG_DIR`, `COPILOT_HOME`, `DSH_HOME`, `OPENCLAW_STATE_DIR` and `OPENCLAW_PROFILE`. On Windows, Hermes lives in `%LOCALAPPDATA%\hermes`. A relative value of a tool's own variable resolves against the directory you run teamai from, as the tool resolves it; a relative `XDG_CONFIG_HOME` or `%LOCALAPPDATA%` is ignored. teamai syncs to the moved home. For OpenCode, Muse, Pi and CodeBuddy only part of it follows so far. With `XDG_CONFIG_HOME=/x`, OpenCode's skills, agents, rules at `/x/opencode/rules`, instruction blocks at `/x/opencode/teamai-context.md`, and the `opencode.json` that MCP and `teamai models switch` write go to `/x/opencode`. Muse's skills and agents go to `/x/muse`, its MCP config goes to `/x/muse`, and its user rules and instruction blocks are `/x/muse/AGENTS.md`. Muse model settings also follow this home; its hooks stay under `~/.config/muse`. OpenCode hooks stay under `~/.config/opencode`. With `PI_CODING_AGENT_DIR=/x`, Pi's skills, MCP config and `models.json` go to `/x`, and its user rules and instruction blocks are `/x/AGENTS.md`, while its extension stays under `~/.pi/agent`. With `CODEBUDDY_CONFIG_DIR=/x`, CodeBuddy's skills, rules, agents, `CODEBUDDY.md` and MCP files go to `/x`, `.codebuddy.json` included, while its hooks stay in `~/.codebuddy/settings.json`. `teamai doctor` notes it.
 
 The first `pull` that sees the variable records the home for the whole machine in `~/.teamai/tool-homes.json` when the directory exists, and never replaces a record. `teamai init` records it too and replaces an earlier record: for a tool's own variable (`HERMES_HOME`, `OPENCLAW_PROFILE`, ...) even before the directory exists, for `XDG_CONFIG_HOME` only once it does. Hermes' Windows default only fills a missing record. So run `init` from a shell your tools run in. After that, a pull from a shell without the variable still syncs there, in every scope. To move the home, run `teamai init` with the new value. To clear the record, run it with the variable set but blank. `teamai doctor` reports `<tool> home exists` when the recorded directory is gone, and `<tool> home matches <variable>` when the shell names another directory.
 
@@ -154,10 +157,10 @@ profiles:
 | Claude Code | `anthropic` | `~/.claude/settings.json` |
 | Codex | `openai-responses` | `~/.codex/config.toml` |
 | OpenCode | any | `opencode.json` |
-| CodeBuddy / WorkBuddy | `openai-chat-completions` | `models.json` |
+| CodeBuddy / WorkBuddy | `openai-chat-completions` | `models.json` (CodeBuddy follows its recorded home) |
 | Pi | any | `~/.pi/agent/models.json` |
 | OMP | any | `~/.omp/agent/models.yml` |
-| Muse Code | `openai-responses` | `~/.config/muse/settings.json`, and the key as `META_API_KEY` in `~/.teamai/models/env.sh`, which your shell profile loads |
+| Muse Code | `openai-responses` | `<Muse home>/settings.json` (recorded home, else `$XDG_CONFIG_HOME/muse` or `~/.config/muse`), and the key as `META_API_KEY` in `~/.teamai/models/env.sh`, which your shell profile loads |
 
 The example has no `openai-responses` group, so Codex and Muse Code are left alone.
 
@@ -213,3 +216,7 @@ teamai models remove local:my-gateway
 ```
 
 `restore` puts back only the fields TeamAI changed. An agent you edited yourself is skipped by later switches and restores.
+
+## ZCode hook stdout budget
+
+Doctor measures the serialized project-rules reply in UTF-8 bytes against `hooks.maxOutputBytes` in `~/.zcode/cli/config.json` (32768 by default). This is a lower bound: other session hints add bytes to the complete reply. ZCode truncates oversized stdout and silently drops a reply that no longer parses, even when its hook is registered. Shorten the rules or increase that positive integer limit enough for the complete reply, then start a new ZCode session. TeamAI does not change the limit or truncate rules.

@@ -6,6 +6,7 @@ import type { LocalConfig } from '../types.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { leaseNext, reportAttempt, startRun } from '../workflow/engine.js';
 import type { DriverIdentity } from '../workflow/types.js';
+import { knownSecrets } from '../env-resolution.js';
 
 // Settling reads a step instance's scope from its path, so the number of paths parsed counts settle work without a clock.
 const counter = vi.hoisted(() => ({ parsed: 0, read: 0, status: 0 }));
@@ -22,22 +23,24 @@ vi.mock('../workflow/step-path.js', async (importOriginal) => {
 
 // Every scan over a run's step instances reads each one's path, so the number of `id` reads counts how many it looks at.
 // Counting the instances started against `max_parallel` reads only their `status`, which `status` reads count.
+// The engine reads a run it changes inside updateRun, so the steps are counted there as well as on a plain read.
 vi.mock('../workflow/store.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../workflow/store.js')>();
+  const counted = <T extends Awaited<ReturnType<typeof actual.readRun>>>(run: T): T => {
+    if (typeof run === 'string') return run;
+    run.steps = run.steps.map((state) => new Proxy(state, {
+      get: (target, key, receiver) => {
+        if (key === 'id') counter.read += 1;
+        if (key === 'status') counter.status += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    }));
+    return run;
+  };
   return {
     ...actual,
-    readRun: async (...args: Parameters<typeof actual.readRun>) => {
-      const run = await actual.readRun(...args);
-      if (typeof run === 'string') return run;
-      run.steps = run.steps.map((state) => new Proxy(state, {
-        get: (target, key, receiver) => {
-          if (key === 'id') counter.read += 1;
-          if (key === 'status') counter.status += 1;
-          return Reflect.get(target, key, receiver);
-        },
-      }));
-      return run;
-    },
+    readRun: async (...args: Parameters<typeof actual.readRun>) => counted(await actual.readRun(...args)),
+    updateRun: (...[config, runId, secrets, change]: Parameters<typeof actual.updateRun>) => actual.updateRun(config, runId, secrets, async (run) => change(counted(run))),
   };
 });
 
@@ -128,7 +131,7 @@ async function startFan(items: number, body = FAN, item = (index: number): unkno
     additionalRoles: [], projectRoot: root, dataHome: path.join(root, 'data'), usageReportEnabled: false,
   };
   await syncWorkflowDefinitions(config);
-  const started = await startRun(config, 'fan', { xs: Array.from({ length: items }, (_, index) => item(index)) });
+  const started = await startRun(config, 'fan', { xs: Array.from({ length: items }, (_, index) => item(index)) }, { secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   return { config, run: String(started.data.run) };
 }

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { syncScorerDefinitions, type SyncScorerOptions, type SyncScorerResult } from '../scorers/cache.js';
 import { log } from '../utils/logger.js';
 import { pathExists, readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
 import { isSafeNamespaceSegment } from '../manifest-schema.js';
@@ -14,22 +16,48 @@ import {
   managedMcpWorkspaceId,
   type LocalConfig,
 } from '../types.js';
+import { LineCounter, parseDocument } from 'yaml';
 import { formatDiagnostic, parseWorkflow, promptFileDiagnostics, stepField } from './parse.js';
-import type { WorkflowFiles } from './parse-context.js';
+import { locate, valueNode, type WorkflowFiles } from './parse-context.js';
 import type { CachedWorkflow, WorkflowDefinition, WorkflowDiagnostic, WorkflowStep } from './types.js';
 import { assertSafePath, assertWithinRoot } from '../utils/path-safety.js';
-import { createGit, getHeadCommit } from '../utils/git.js';
+import { createGit } from '../utils/git.js';
+import {
+  remotelyReachableRevision, revisionHoldsSources, withoutStaleTeamRevision, type ReachableRevision,
+} from '../utils/team-revision.js';
 
-export interface SyncWorkflowOptions {
-  dryRun?: boolean;
-  scopeLabel?: string;
-}
+export type SyncWorkflowOptions = SyncScorerOptions;
 
 export interface SyncWorkflowResult {
   cached: string[];
   kept: string[];
   invalid: WorkflowDiagnostic[];
   unrunnable: string[];
+  /** The scorers of the same tree, synced first. */
+  scorers: SyncScorerResult;
+  /** Scorers a step lists that `scorers` has no valid version of. The workflow still runs; the step runs without them. */
+  unknownScorers: UnknownScorer[];
+  /** `alias_conflict` on each cached workflow whose alias another one has as alias or name. Each still starts by name. */
+  aliasConflicts: WorkflowDiagnostic[];
+}
+
+export interface UnknownScorer {
+  file: string;
+  /** The step's path, such as `check.review`. */
+  step: string;
+  scorer: string;
+}
+
+export function formatUnknownScorer({ file, step, scorer }: UnknownScorer): string {
+  return `${file}: step "${step}" lists scorer "${scorer}", which has no valid scorers/${scorer}.md; the step runs without it`;
+}
+
+/** The scorers a definition's steps list, including inside its inline workflows, with each step's path. */
+function scorersListedBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; scorer: string }> {
+  return definition.steps.flatMap((step) => [
+    ...(step.scorers?.names ?? []).map((scorer) => ({ step: `${prefix}${step.id}`, scorer })),
+    ...(typeof step.workflow === 'object' ? scorersListedBy(step.workflow, `${prefix}${step.id}.`) : []),
+  ]);
 }
 
 /** One version of a file, as its reference checks read it: this revision, or the copy the cache keeps. */
@@ -46,13 +74,6 @@ interface Candidate extends Version {
   sourceHash: string;
   teamRevision?: string;
 }
-
-interface ReachableRevision {
-  repositoryRoot: string;
-  revision: string;
-}
-
-const TEAM_REMOTE_REFS = 'refs/remotes/origin/';
 
 /** What a file runs after this sync, and why the versions it did not pick cannot run. */
 interface Settled {
@@ -96,7 +117,18 @@ async function readCache(config: LocalConfig, name: string): Promise<CachedWorkf
 /** The last validated definition for `name`, or null when this file has never been valid. */
 export async function loadCachedWorkflow(config: LocalConfig, name: string): Promise<CachedWorkflow | null> {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return null;
-  return readCache(config, name);
+  const direct = await readCache(config, name);
+  if (direct) return direct;
+  const aliases = (await listCachedWorkflows(config)).filter((entry) => entry.definition.alias === name);
+  return aliases.length === 1 ? aliases[0] : null;
+}
+
+/** All runnable cached files in stable name order, without resolving aliases recursively. */
+export async function listCachedWorkflows(config: LocalConfig): Promise<CachedWorkflow[]> {
+  let files: string[];
+  try { files = await fs.readdir(cacheDir(config)); } catch { return []; }
+  const entries = await Promise.all(files.filter((file) => file.endsWith('.json')).sort().map((file) => readCache(config, file.slice(0, -5))));
+  return entries.filter((entry): entry is CachedWorkflow => entry !== null);
 }
 
 /** Removes every cached workflow this sync did not settle to a version, missing files included. */
@@ -125,61 +157,8 @@ async function workflowFileNames(dir: string): Promise<string[]> {
   }
 }
 
-async function isTeamRemoteRevision(root: string, revision: string): Promise<boolean> {
-  try {
-    const refs = await createGit(root).raw([
-      'for-each-ref', `--contains=${revision}`, '--format=%(refname)', TEAM_REMOTE_REFS,
-    ]);
-    return refs.trim() !== '';
-  } catch {
-    return false;
-  }
-}
-
-/** The checked-out commit, only when the team remote can reach it. */
-async function remotelyReachableRevision(root: string): Promise<ReachableRevision | undefined> {
-  try {
-    const revision = await getHeadCommit(root);
-    if (!revision || !await isTeamRemoteRevision(root, revision)) return undefined;
-    return {
-      repositoryRoot: await fs.realpath((await createGit(root).revparse(['--show-toplevel'])).trim()),
-      revision,
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-async function withoutStaleTeamRevision(root: string, cached: CachedWorkflow | null): Promise<CachedWorkflow | null> {
-  if (!cached?.teamRevision || await isTeamRemoteRevision(root, cached.teamRevision)) return cached;
-  const next = { ...cached };
-  delete next.teamRevision;
-  return next;
-}
-
-/** Whether `revision` stores every source byte exactly as the cache read it. */
-async function revisionHoldsSources(
-  knowledgeRoot: string,
-  reachable: ReachableRevision | undefined,
-  sources: Array<{ path: string; content: string }>,
-): Promise<boolean> {
-  if (!reachable) return false;
-  const git = createGit(knowledgeRoot);
-  try {
-    for (const source of sources) {
-      const absolute = path.resolve(knowledgeRoot, source.path);
-      const relative = path.relative(reachable.repositoryRoot, await fs.realpath(absolute)).split(path.sep).join('/');
-      if (relative === '..' || relative.startsWith('../')) return false;
-      if (await git.show([`${reachable.revision}:${relative}`]) !== source.content) return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Validate each `workflows/*.yaml` on its own and cache only files that pass.
+ * Validate `scorers/` first, then each `workflows/*.yaml` on its own, and cache only files that pass.
  * An invalid file keeps its last cached definition; a file that was never valid
  * stays unrunnable. The cache then holds only what this sync settled, so start
  * finds no version that was not checked against the others. Nothing here fails the caller.
@@ -188,7 +167,8 @@ export async function syncWorkflowDefinitions(
   config: LocalConfig,
   options: SyncWorkflowOptions = {},
 ): Promise<SyncWorkflowResult> {
-  const result: SyncWorkflowResult = { cached: [], kept: [], invalid: [], unrunnable: [] };
+  const scorers = await syncScorerDefinitions(config, options);
+  const result: SyncWorkflowResult = { cached: [], kept: [], invalid: [], unrunnable: [], scorers, unknownScorers: [], aliasConflicts: [] };
   const dir = path.join(getKnowledgeDir(config), 'workflows');
   const knowledgeRoot = getKnowledgeDir(config);
   // Asked on the first valid file: a team without workflows starts no git here.
@@ -412,6 +392,23 @@ export async function syncWorkflowDefinitions(
     wrote += 1;
   }
   if (!options.dryRun) await dropUnsettled(config, new Set([...result.cached, ...result.kept]));
+  const valid = new Set(scorers.cached);
+  for (const file of checked) {
+    const definition = settle(file.stem).definition;
+    for (const { step, scorer } of definition ? scorersListedBy(definition) : []) {
+      if (!valid.has(scorer)) result.unknownScorers.push({ file: file.relativePath, step, scorer });
+    }
+  }
+  for (const unknown of result.unknownScorers) log.warn(`[workflows] ${formatUnknownScorer(unknown)}`);
+  const versions = checked.flatMap((file): AliasSource[] => {
+    const { definition, revision } = settle(file.stem);
+    if (!definition) return [];
+    if (!('diagnostics' in file) && revision.length === 0) return [{ relativePath: file.relativePath, content: file.content, definition }];
+    const copy = kept.get(file.stem);
+    return copy ? [{ relativePath: copy.relativePath, content: copy.content, definition }] : [];
+  });
+  result.aliasConflicts = aliasConflicts(versions);
+  for (const conflict of result.aliasConflicts) log.warn(`[workflows] ${formatDiagnostic(conflict)}`);
 
   const scope = options.scopeLabel ?? config.scope;
   if (options.dryRun && result.cached.length > 0) {
@@ -420,6 +417,24 @@ export async function syncWorkflowDefinitions(
     log.success(`[${scope}] Synced ${wrote} workflow${wrote === 1 ? '' : 's'}`);
   }
   return result;
+}
+
+/** The version of a file a sync settled on, with the YAML that locates its alias. */
+type AliasSource = { relativePath: string; content: string | undefined; definition: WorkflowDefinition };
+
+/** Each workflow whose alias another settled workflow has as alias or name. `loadCachedWorkflow` resolves such an alias to no other workflow. */
+function aliasConflicts(versions: AliasSource[]): WorkflowDiagnostic[] {
+  return versions.flatMap(({ relativePath, content, definition: { name, alias } }) => {
+    if (alias === undefined) return [];
+    const named = versions.find((other) => other.definition.name === alias);
+    const twin = versions.find((other) => other.definition.name !== name && other.definition.alias === alias);
+    const message = named ? `alias "${alias}" is also the name of ${named.relativePath}, so it starts that workflow; start ${name} by name`
+      : twin ? `alias "${alias}" is also the alias of ${twin.relativePath}, so it starts neither; start them by name` : undefined;
+    if (!message) return [];
+    const lineCounter = new LineCounter();
+    const document = parseDocument(content ?? '', { lineCounter });
+    return [{ ...locate(relativePath, lineCounter, valueNode(document.contents, 'alias'), 'alias', message), code: 'alias_conflict' }];
+  });
 }
 
 /**
@@ -438,6 +453,106 @@ function dropsKeptVersion(diagnostics: WorkflowDiagnostic[]): boolean {
 export function workflowsRunBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; workflow: string }> {
   return definition.steps.flatMap((step) => (typeof step.workflow === 'object' ? workflowsRunBy(step.workflow, `${prefix}${step.id}.`)
     : step.workflow === undefined ? [] : [{ step: `${prefix}${step.id}`, workflow: step.workflow }]));
+}
+
+/** The workflows a cached workflow runs, by name, and one hash over its sources and theirs. */
+export interface WorkflowTree {
+  workflows: Record<string, WorkflowDefinition>;
+  sourceHash: string;
+  /** The team commit that stores every one of those sources, when one does. */
+  teamRevision?: string;
+}
+
+type TreeFailure = { code: 'workflow_recursion' | 'workflow_not_found'; message: string };
+
+/** Every workflow `cached` runs through its steps, directly or not, from the cache, and one hash over all of their sources. */
+export async function loadWorkflowTree(
+  config: LocalConfig,
+  cached: CachedWorkflow,
+): Promise<WorkflowTree | { failed: TreeFailure }> {
+  const workflows: Record<string, WorkflowDefinition> = {};
+  const hashes: Array<[string, string]> = [];
+  const revisions: Array<string | undefined> = [cached.teamRevision];
+  const visit = async (definition: WorkflowDefinition, through: string[]): Promise<TreeFailure | undefined> => {
+    for (const { step, workflow } of workflowsRunBy(definition)) {
+      if (through.includes(workflow)) {
+        const cycle = [...through.slice(through.indexOf(workflow)), workflow].join(' -> ');
+        return { code: 'workflow_recursion', message: `Workflow "${cached.definition.name}" cannot start: its sub-workflows run in a cycle: ${cycle}` };
+      }
+      if (Object.hasOwn(workflows, workflow)) continue;
+      const child = await loadCachedWorkflow(config, workflow);
+      if (!child) {
+        return { code: 'workflow_not_found', message: `Workflow "${definition.name}" step "${step}" runs workflow "${workflow}", which has no runnable version. Check workflows/${workflow}.yaml and pull again.` };
+      }
+      workflows[workflow] = child.definition;
+      hashes.push([workflow, child.sourceHash]);
+      revisions.push(child.teamRevision);
+      const failed = await visit(child.definition, [...through, workflow]);
+      if (failed) return failed;
+    }
+    return undefined;
+  };
+  const failed = await visit(cached.definition, [cached.definition.name]);
+  if (failed) return { failed };
+  const teamRevision = cached.teamRevision !== undefined && revisions.every((revision) => revision === cached.teamRevision)
+    ? cached.teamRevision
+    : undefined;
+  if (hashes.length === 0) return { workflows, sourceHash: cached.sourceHash, ...(teamRevision ? { teamRevision } : {}) };
+  const hash = createHash('sha256').update(cached.sourceHash);
+  for (const [name, sourceHash] of hashes.sort(([left], [right]) => left.localeCompare(right))) {
+    hash.update('\0').update(name).update('\0').update(sourceHash);
+  }
+  return { workflows, sourceHash: hash.digest('hex'), ...(teamRevision ? { teamRevision } : {}) };
+}
+
+/** A workflow, every workflow it runs, and one hash over all of their sources. */
+export interface WorkflowBundle {
+  definition: WorkflowDefinition;
+  workflows: Record<string, WorkflowDefinition>;
+  sourceHash: string;
+}
+
+export async function loadWorkflowBundle(config: LocalConfig, name: string): Promise<WorkflowBundle | { failed: string }> {
+  const cached = await loadCachedWorkflow(config, name);
+  if (!cached) return { failed: `workflow "${name}" has no runnable version` };
+  const tree = await loadWorkflowTree(config, cached);
+  if ('failed' in tree) return { failed: tree.failed.message };
+  return { definition: cached.definition, workflows: tree.workflows, sourceHash: tree.sourceHash };
+}
+
+/**
+ * Workflow `name` and the workflows it runs as team commit `revision` stores them, synced from a `--shared` clone at that
+ * commit into a cache of its own, so this member's checkout and cache stay as they are. Only a fetch of origin, when the
+ * team repo lacks the commit, touches the member's repository.
+ */
+export async function loadWorkflowBundleAt(config: LocalConfig, name: string, revision: string): Promise<WorkflowBundle | { failed: string }> {
+  const repoRoot = isSelfMode(config) ? getBusinessRoot(config) : config.repo.localPath;
+  const git = createGit(repoRoot);
+  const present = (): Promise<boolean> => git.raw(['cat-file', '-e', `${revision}^{commit}`]).then(() => true, () => false);
+  if (!await present()) {
+    const fetched = await git.fetch(['origin']).then(() => '', (error: unknown) => (error instanceof Error ? error.message.trim() : String(error)));
+    if (!await present()) {
+      return { failed: `the team repo at ${repoRoot} does not have it, even after fetching origin${fetched ? ` (${fetched})` : ''}` };
+    }
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-revision-'));
+  try {
+    const clone = path.join(dir, 'team');
+    await git.raw(['clone', '--quiet', '--shared', '--no-checkout', repoRoot, clone]);
+    await createGit(clone).raw(['checkout', '--quiet', '--detach', revision]);
+    const knowledge = path.join(clone, path.relative(repoRoot, config.repo.localPath));
+    const at: LocalConfig = {
+      ...config,
+      repo: isSelfMode(config) ? { ...config.repo, localPath: knowledge, businessRepoRoot: clone } : { ...config.repo, localPath: knowledge },
+      dataHome: path.join(dir, 'data'),
+    };
+    await syncWorkflowDefinitions(at, { scopeLabel: `team commit ${revision.slice(0, 7)}` });
+    return await loadWorkflowBundle(at, name);
+  } catch (error) {
+    return { failed: error instanceof Error ? error.message.trim() : String(error) };
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }
 
 /**

@@ -1,8 +1,8 @@
 /**
  * Scorer namespaces resolve the way prompts do: a scorers/<dir>/ that any role
  * or project lists under `resources.scorers` is a namespace, active only for the
- * members who select it. Pull has no scorers reader yet (#1085); this is the
- * shape that reader will consume.
+ * members who select it. The scorer cache (src/scorers/cache.ts) reads this
+ * shape.
  */
 import { describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';

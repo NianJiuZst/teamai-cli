@@ -84,6 +84,7 @@ vi.mock('../providers/tgit/gf-cli.js', () => {
     ensureGfInstalled: () => mockEnsureGfInstalled(),
     ensureAuthenticated: vi.fn().mockReturnValue('testuser'),
     isGfInstalled: vi.fn().mockReturnValue(true),
+    tgitFindOpenMr: vi.fn(),
     RepoNotFoundError,
   };
 });
@@ -124,6 +125,7 @@ vi.mock('../local-agent.js', async (importOriginal) => ({
 }));
 vi.mock('../hooks.js', async (importOriginal) => ({
   describeUnappliedTeamHooks: (await importOriginal<typeof import('../hooks.js')>()).describeUnappliedTeamHooks,
+  codexTrustPolicy: (await importOriginal<typeof import('../hooks.js')>()).codexTrustPolicy,
   injectHooksToAllTools: vi.fn(),
   reconcileTeamHooksForConfig: vi.fn(async () => ({ ok: true, defs: [] })),
   deliveredHookFiles: vi.fn(async () => []),

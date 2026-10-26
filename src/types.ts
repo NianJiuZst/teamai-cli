@@ -6,6 +6,7 @@ import { log } from './utils/logger.js';
 import { realHost, toolHome } from './tool-home.js';
 import type { WorkspaceChildren } from './workspace-children.js';
 import type { HeadState } from './utils/git.js';
+import { AllowSchema } from './workflow/requirements.js';
 
 const COPILOT_USER_MCP_CONFIG = 'mcp-config.json';
 const COPILOT_PROJECT_MCP_CONFIG = '.github/mcp.json';
@@ -883,6 +884,10 @@ export const LocalConfigSchema = z.object({
     max_parallel: z.number().int().positive().optional(),
     /** Whether a driver without HITL automatically answers optional approve requests and uses choose defaults. Unset means false. */
     auto_approve: z.boolean().optional(),
+    /** This host contains what it runs, such as a CI VM or a container, so the local driver declares `sandbox` isolation. */
+    sandbox: z.boolean().optional(),
+    /** What a workflow step may use on this machine, whatever driver runs it. An unset key allows. */
+    allow: AllowSchema.optional(),
   }).optional(),
   /**
    * Per-machine map from a gateway/proxy model alias to a known Claude model
@@ -892,6 +897,14 @@ export const LocalConfigSchema = z.object({
    * mythos + version). Unset means "match the raw model name only".
    */
   modelAliases: z.record(z.string(), z.string()).optional(),
+  scoring: z.object({
+    /** The least isolation a judge of this scope needs, raising the team's and the scorer's. A value teamai does not know counts as `verified`. */
+    isolation: z.string().optional().catch(({ input }) => JSON.stringify(input)),
+    /** Judge this scope's finished agent sessions in the background. A value that is not true or false is kept as its text, which turns nothing on. */
+    sessions: z.union([z.boolean(), z.string()]).optional().catch(({ input }) => JSON.stringify(input)),
+    /** How many sessions a local day may lease for judging; 0 turns session scoring off. Another value is kept as its text, which sets nothing. */
+    daily_limit: z.union([z.number().int().nonnegative(), z.string()]).optional().catch(({ input }) => JSON.stringify(input)),
+  }).optional(),
 });
 
 /**
@@ -922,7 +935,22 @@ export type LocalConfig = z.infer<typeof LocalConfigSchema> & {
   dataHome?: string;
   roleUnresolved?: true;
   children?: WorkspaceChildren;
+  roleAssignment?: RoleAssignment;
 };
+
+/**
+ * Runtime-only, set when `manifest/members.yaml` governs this member's roles
+ * (#1186): `primaryRole` and `additionalRoles` then hold the team's assignment,
+ * read fresh on every load, and `local` keeps what the config file says so a
+ * save by any other command writes that back instead of freezing a copy of the
+ * assignment into the file.
+ */
+export interface RoleAssignment {
+  /** `assigned` — the file lists this member; `default` — it does not. */
+  source: 'assigned' | 'default';
+  /** The selection on disk, which `roles set` no longer changes. */
+  local: { primaryRole?: string; additionalRoles: string[] };
+}
 export type LocalConfigInput = z.input<typeof LocalConfigSchema>;
 
 // ─── Local state (~/.teamai/state.json) ────────────────────
@@ -1007,9 +1035,37 @@ export type RecordedAgentModel = z.infer<typeof RecordedAgentModelSchema>;
 /** `RecordedAgentModel` by agent stem, then tool. */
 export type AgentModelRecords = Record<string, Record<string, RecordedAgentModel>>;
 
+/** One Codex binary teamai found, and the version its `--version` printed (null when it did not parse). */
+const CodexBuildSchema = z.object({ path: z.string(), version: z.string().nullable() });
+export type CodexBuild = z.infer<typeof CodexBuildSchema>;
+
+/**
+ * Builds that hash a teamai hook differently: teamai trusts with `chosen`, the
+ * newest, and each of `others` hashes at least one of those hooks another way.
+ */
+const CodexBuildSkewSchema = z.object({ chosen: CodexBuildSchema, others: z.array(CodexBuildSchema) });
+export type CodexBuildSkew = z.infer<typeof CodexBuildSkewSchema>;
+
 /** A repo-backed placement that landed: the placed path and the blob push delivered there. */
 const PlacementRecordSchema = z.object({ path: z.string(), blob: z.string() });
 export type PlacementRecord = z.infer<typeof PlacementRecordSchema>;
+
+/**
+ * The member's choices that decide which team assets a pull delivers (#1178), as that pull read them from
+ * `LocalConfig`. The lists are sorted, so the same choices compare equal however they were entered.
+ */
+export const DeliverySelectionSchema = z.object({
+  scope: InstallScopeSchema,
+  primaryRole: z.string().optional(),
+  additionalRoles: z.array(z.string()),
+  /** The roles came from manifest/members.yaml (#1186): holding none then filters, where a bare config does not. */
+  rolesAssigned: z.boolean().optional(),
+  projects: z.array(z.string()).optional(),
+  subscribedTags: z.array(z.string()).optional(),
+  excludedSkills: z.array(z.string()).optional(),
+  inheritUserScope: z.boolean().optional(),
+});
+export type DeliverySelection = z.infer<typeof DeliverySelectionSchema>;
 
 export const StateSchema = z.object({
   lastPush: z.string().nullable().default(null),
@@ -1089,6 +1145,8 @@ export const StateSchema = z.object({
     rootsSeeded: z.boolean().optional(),
     /** The children a workspace was last delivered with (`WorkspaceChildren.fingerprint`, #913). */
     children: z.string().optional(),
+    /** The selection the last pull that delivered into this checkout read. Absent in a record an older CLI wrote. */
+    selection: DeliverySelectionSchema.optional(),
     /**
      * The `claudeMdExcludes` entries teamai wrote into this checkout's
      * `.claude/settings.local.json` for the workspaces above it (#913).
@@ -1181,6 +1239,10 @@ export const StateSchema = z.object({
    * inputs still match skips spawning `codex app-server`. Absent = run it.
    */
   codexTrustFingerprint: z.string().optional(),
+  /** The Codex builds that disagreed in that pass (#1244), so a pull that skips it still warns. Absent = none. */
+  codexBuildSkew: CodexBuildSkewSchema.optional(),
+  /** The Codex builds that could not list the hooks in the last uncached pass; the same set failing again is cached. Absent = none. */
+  codexBuildUncompared: z.array(CodexBuildSchema).optional(),
   /** Project grants this installation actually created; pre-existing user choices are never recorded. */
   codexProjectTrust: z.array(z.object({ home: z.string(), project: z.string() })).optional(),
   /**
@@ -1381,6 +1443,8 @@ export interface ManagedMcpRecord {
   name: string;
   /** sha1 (first 16 hex) of the rendered entry; drives idempotent rewrites. */
   hash: string;
+  /** Muse only: content fingerprint ignoring object key order and an inferred stdio type. */
+  valueHash?: string;
   /**
    * Project scope: whether the entry holds a `${VAR}` value teamai resolved
    * (#882). Absent in records an older teamai wrote.
@@ -2268,8 +2332,21 @@ export interface SearchIndexEntry {
 /** Schema version of the on-disk search-index.json (bump on breaking change). */
 export const SEARCH_INDEX_VERSION = 7;
 
+/** Per-file derivation only; votes and selection are recomputed on every build. */
+export interface SearchIndexFileCache {
+  derivation: string;
+  files: Array<{
+    key: string;
+    fingerprint: string;
+    hash: string;
+    /** Selected entries refer to `SearchIndex.entries` instead of duplicating tokens. */
+    entry: number | SearchIndexEntry | null;
+  }>;
+}
+
 /** Shape of the search-index.json file. */
 export interface SearchIndex {
+  fileCache?: SearchIndexFileCache;
   /** Schema version. Phase 1 introduces v2 (multi-category index). */
   version?: number;
   /** ISO timestamp of when the index was built */

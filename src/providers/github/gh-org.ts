@@ -43,8 +43,10 @@ function ghApiPage(endpoint: string): GhRepoApiItem[] {
  */
 // 响应体最大 50 MB，防止恶意服务器返回超大响应导致 OOM
 const MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 async function fetchApiPage(url: string, token: string): Promise<GhRepoApiItem[]> {
+  const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   // redirect: 'manual' 防止跟随重定向到内网地址（SSRF）
   const resp = await fetch(url, {
     headers: {
@@ -53,12 +55,14 @@ async function fetchApiPage(url: string, token: string): Promise<GhRepoApiItem[]
       'X-GitHub-Api-Version': '2022-11-28',
     },
     redirect: 'manual',
+    signal,
   });
   if (resp.status >= 300 && resp.status < 400) {
     throw new Error(`Unexpected redirect from GitHub API: ${resp.status}`);
   }
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
+    if (signal.aborted) throw signal.reason;
     throw new Error(`GitHub API error ${resp.status}: ${body}`);
   }
 
@@ -68,7 +72,9 @@ async function fetchApiPage(url: string, token: string): Promise<GhRepoApiItem[]
   const chunks: Uint8Array[] = [];
   if (reader) {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read().catch((err: unknown) => {
+        throw signal.aborted ? signal.reason : err;
+      });
       if (done) break;
       received += value.length;
       if (received > MAX_RESPONSE_BYTES) {
@@ -118,13 +124,13 @@ function mapToOrgRepoInfo(item: GhRepoApiItem): OrgRepoInfo {
  */
 export async function ghListOrgRepos(
   org: string,
-  opts?: { maxRepos?: number },
+  opts?: { maxRepos?: number; apiBaseUrl?: string },
 ): Promise<OrgRepoInfo[]> {
   const maxRepos = opts?.maxRepos ?? 200;
   const perPage = 100;
   const results: OrgRepoInfo[] = [];
 
-  if (isGhInstalled()) {
+  if (!opts?.apiBaseUrl && isGhInstalled()) {
     // 使用 gh CLI 分页拉取
     const tryEndpointPrefix = async (prefix: string, allowFallback = false): Promise<boolean> => {
       let page = 1;
@@ -165,7 +171,7 @@ export async function ghListOrgRepos(
       );
     }
 
-    const BASE = 'https://api.github.com';
+    const BASE = opts?.apiBaseUrl ?? 'https://api.github.com';
     const tryUrl = async (urlPrefix: string, allowFallback = false): Promise<boolean> => {
       let page = 1;
       while (results.length < maxRepos) {
@@ -175,7 +181,7 @@ export async function ghListOrgRepos(
         try {
           items = await fetchApiPage(url, token);
         } catch (err) {
-          if (page === 1 && allowFallback) {
+          if (page === 1 && allowFallback && !(err instanceof Error && err.name === 'TimeoutError')) {
             log.debug(`fetch ${urlPrefix} failed: ${String(err)}`);
             return false;
           }

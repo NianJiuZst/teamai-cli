@@ -1,39 +1,16 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { resolveProjectDataHome } from '../../config.js';
-import { workflowConformanceScenarios, type WorkflowClient } from '../../workflow/conformance.js';
-import type { DriverIdentity, RunState, WorkflowEnvelope } from '../../workflow/types.js';
+import { DRIVERS_UNDER_TEST, runConformanceScenario, speaksAsDriverUnderTest } from '../../workflow/conformance-interpreter.js';
+import { workflowConformanceScenarios } from '../../workflow/conformance/run.js';
+import type { RunState, WorkflowEnvelope } from '../../workflow/types.js';
+import { cliConformanceClient, envelope, runCLI } from '../helpers/cli-conformance.js';
+import { inProcessConformanceRunner, normalized, recorded, UNREACHABLE_ORIGIN } from '../helpers/in-process-conformance.js';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const CLI = path.join(ROOT, 'dist', 'index.js');
-const driver: DriverIdentity = { kind: 'local', machine: 'cli-conformance', workspace: '/work' };
-
-function runCLI(args: string[], cwd: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [CLI, ...args], {
-      cwd,
-      env: { ...process.env, FORCE_COLOR: '0' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
-  });
-}
-
-function envelope(stdout: string): WorkflowEnvelope {
-  const line = stdout.trim().split('\n').filter((item) => item.startsWith('{')).at(-1);
-  if (!line) throw new Error(`no JSON envelope in stdout:\n${stdout}`);
-  return JSON.parse(line) as WorkflowEnvelope;
-}
-
-describe('workflow protocol conformance through the CLI', () => {
+describe.each(DRIVERS_UNDER_TEST)('workflow protocol conformance through the CLI as %s', (profile) => {
   let repo: string;
 
   beforeAll(async () => {
@@ -42,16 +19,25 @@ describe('workflow protocol conformance through the CLI', () => {
     execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo });
     execFileSync('git', ['add', 'README.md'], { cwd: repo });
     execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'initial'], { cwd: repo });
-    execFileSync('git', ['remote', 'add', 'origin', 'http://127.0.0.1:9/team/workflow.git'], { cwd: repo });
+    execFileSync('git', ['remote', 'add', 'origin', UNREACHABLE_ORIGIN], { cwd: repo });
     const initialized = await runCLI(['init', '--self', '--agent', 'claude', '--force'], repo);
     expect(initialized.code, `${initialized.stdout}\n${initialized.stderr}`).toBe(0);
   });
 
-  afterAll(() => {
-    if (repo) fs.rmSync(repo, { recursive: true, force: true });
+  const dirs: string[] = [];
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
   });
 
-  for (const scenario of workflowConformanceScenarios) {
+  afterAll(() => {
+    if (repo) fs.rmSync(repo, { recursive: true, force: true });
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // A scenario that never speaks as the driver under test makes the same calls under every profile, so it runs under the first.
+  for (const scenario of workflowConformanceScenarios.filter((item) => profile === DRIVERS_UNDER_TEST[0] || speaksAsDriverUnderTest(item))) {
     it(scenario.name, async () => {
       const workflows = path.join(repo, '.teamai', 'workflows');
       fs.mkdirSync(workflows, { recursive: true });
@@ -61,79 +47,37 @@ describe('workflow protocol conformance through the CLI', () => {
       }
       const pulled = await runCLI(['pull'], repo);
       expect(pulled.code, `${pulled.stdout}\n${pulled.stderr}`).toBe(0);
-      const call = async (args: string[]): Promise<WorkflowEnvelope> => envelope((await runCLI(['workflow', ...args], repo)).stdout);
-      const client: WorkflowClient = {
-        start: (name) => call(['start', name]),
-        next: (run, body) => call(['next', run, '--json', JSON.stringify(body)]),
-        report: (run, body) => call(['report', run, '--json', JSON.stringify(body)]),
-        respond: (run, step, choice, options) => call(['respond', run, step, choice, ...(options?.note !== undefined ? ['--note', options.note] : []), ...(options?.pass !== undefined ? ['--pass', String(options.pass)] : []), ...(options?.json !== undefined ? ['--json', JSON.stringify(options.json)] : [])]),
-        retry: (run, step) => call(['retry', run, step]),
-        cancel: (run, step) => call(['cancel', run, ...(step !== undefined ? [step] : [])]),
+      const env = { ...process.env, ...scenario.env };
+      const call = async (args: string[], extra: Record<string, string> = {}): Promise<WorkflowEnvelope> => {
+        const { stdout } = await runCLI(['workflow', ...args], repo, { ...env, ...extra });
+        for (const [name, value] of Object.entries(scenario.env ?? {})) expect(stdout.includes(value), `workflow ${args[0]} printed the value of ${name}`).toBe(false);
+        return envelope(stdout);
       };
-      const started = await client.start(scenario.workflowName);
-      if ('error' in started) throw new Error(started.error.message);
-      const runId = String(started.data.run);
-      const leases = new Map<string, { attempt: string; revision: number }>();
-      const attemptOf = (name: string): string | undefined => leases.get(name)?.attempt;
-      for (const operation of scenario.operations) {
-        if (operation.kind === 'next') {
-          const value = await client.next(runId, {
-            driver: { ...driver, ...(operation.hitl !== undefined ? { can: { hitl: operation.hitl } } : {}) },
-            ...(operation.running ? { running: operation.running.map(attemptOf) } : {}),
-            ...(operation.canTakeLease !== undefined ? { canTakeLease: operation.canTakeLease } : {}),
-          });
-          expect(value).toMatchObject(operation.expect);
-          if (operation.saveAs === 'busy') {
-            const dataHome = await resolveProjectDataHome(repo);
-            const stored = JSON.parse(fs.readFileSync(path.join(dataHome, 'workflows', 'runs', `${runId}.json`), 'utf8')) as RunState;
-            expect(stored).toMatchObject({ steps: [{ id: 'work', status: 'waiting' }, { id: 'later', status: 'pending' }, { id: 'parallel', status: 'leased' }] });
-          }
-          if ('data' in value && value.data.hitl) {
-            const hitl = value.data.hitl as { step: string; pass: number; respond: string };
-            expect(hitl.respond).toBe(`teamai workflow respond ${runId} ${hitl.step} <option> --pass ${hitl.pass}`);
-          }
-          if (operation.cancelled) expect('data' in value && value.data.cancelled).toEqual(operation.cancelled.map(attemptOf));
-          for (const field of operation.absent ?? []) expect('data' in value ? value.data.lease : undefined).not.toHaveProperty(field);
-          if ('data' in value && value.data.lease) {
-            leases.set(operation.saveAs, value.data.lease as { attempt: string; revision: number });
-          }
-          continue;
-        }
-        if (operation.kind === 'respond' || operation.kind === 'retry' || operation.kind === 'cancel') {
-          const value = operation.kind === 'respond' ? await client.respond(runId, operation.step, operation.choice, { note: operation.note, pass: operation.pass, json: operation.json })
-            : operation.kind === 'retry' ? await client.retry(runId, operation.step) : await client.cancel(runId, operation.step);
-          expect(value).toMatchObject(operation.expect);
-          continue;
-        }
-        const lease = operation.lease ? leases.get(operation.lease) : undefined;
-        const value = await client.report(runId, {
-          attempt: operation.attempt ?? lease?.attempt,
-          revision: operation.revision ?? lease?.revision,
-          driver,
-          ...operation.body,
-        });
-        expect(value).toMatchObject(operation.expect);
-      }
-      if (scenario.expectState || scenario.name === 'two-step command success' || scenario.name === 'output mismatch fails the step') {
-        const dataHome = await resolveProjectDataHome(repo);
-        const stored = JSON.parse(fs.readFileSync(path.join(dataHome, 'workflows', 'runs', `${runId}.json`), 'utf8')) as RunState;
-        if (scenario.expectState) expect(stored).toMatchObject(scenario.expectState);
-        if (scenario.name === 'two-step command success') {
-          expect(stored.steps[1]).toMatchObject({
-            status: 'succeeded',
-            outputs: { ok: true },
-            tool: 'claude',
-            model: 'claude-sonnet',
-            session: 'session-1',
-            tokens: { input: 3, output: 2, cachedInput: 1 },
-          });
-        } else if (scenario.name === 'output mismatch fails the step') {
-          expect(stored.steps[0]).toMatchObject({
-            status: 'failed',
-            failure: { code: 'invalid_output', message: expect.stringContaining('does not match output') },
-          });
-        }
-      }
+      const cli = recorded(cliConformanceClient(call));
+      await runConformanceScenario(scenario, {
+        client: cli.client,
+        readRun: async (runId) => {
+          const dataHome = await resolveProjectDataHome(repo);
+          return JSON.parse(fs.readFileSync(path.join(dataHome, 'workflows', 'runs', `${runId}.json`), 'utf8')) as RunState;
+        },
+        readEndRecord: async (runId) => {
+          const dataHome = await resolveProjectDataHome(repo);
+          const file = path.join(dataHome, 'workflows', 'pending', `${runId}.end.json`);
+          return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) as unknown : undefined;
+        },
+        // Each CLI call reads the system clock, so the runner waits for real.
+        advance: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+        expect,
+      }, profile);
+
+      // The in-process client answers the same scenario, started from a checkout as the CLI's is, with the envelopes the CLI prints.
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-workflow-conformance-'));
+      dirs.push(root);
+      const inProcess = await inProcessConformanceRunner(scenario, root, { checkout: true });
+      const local = recorded(inProcess.runner.client);
+      await runConformanceScenario(scenario, { ...inProcess.runner, client: local.client, expect }, profile);
+      const places = { knowledge: path.join(repo, '.teamai'), data: await resolveProjectDataHome(repo), project: repo };
+      expect(normalized(cli.envelopes, places), 'the CLI and the in-process client answer alike').toEqual(normalized(inProcess.printed(local.envelopes), inProcess.places));
     });
   }
 });

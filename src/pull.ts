@@ -1,13 +1,14 @@
 import { hookToolPathsForConfig } from './types.js';
 import path from 'node:path';
 import { readFile, realpath, stat } from 'node:fs/promises';
+import { isDeepStrictEqual } from 'node:util';
 import matter from 'gray-matter';
 import {
   buildRolePullContext, collectClaudemdFiles, describeDeliveryConflict, indexedRuleFiles,
   indexedSkills, resolveDesiredAgents, resolveDesiredRules, resolveDesiredSkills, type RolePullContext,
 } from './resources/desired.js';
 import type { IndexedSkills, UnreadableFile } from './utils/search-index.js';
-import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope, saveLocalConfigForScope } from './config.js';
+import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, refreshRoleAssignment, saveStateForScope, saveLocalConfigForScope } from './config.js';
 import { getHeadRev, getHeadCommit, createGit, getDefaultBranch, completeWorktreeList, gitCommonDir, isLiveCheckout, isLiveProjectCheckout, listWorktrees, resolveAnchors } from './utils/git.js';
 import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { pendingLearningsDir } from './utils/pending-learnings.js';
@@ -40,7 +41,7 @@ import {
   type DeliveredHashes, type DeliveryLedger,
 } from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
-import type { AgentModelRecords, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
+import type { AgentModelRecords, CodexBuildSkew, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
 import {
   getUserLearningsDir,
   TEAMAI_CULTURE_START,
@@ -64,6 +65,8 @@ import {
   managedMcpWorkspaceId,
   SOURCE_PULL_TTL_MS,
   installScopeName,
+  DeliverySelectionSchema,
+  type DeliverySelection,
 } from './types.js';
 import type { CultureFrontmatter } from './types.js';
 import { deliversEveryNamespace } from './resource-namespaces.js';
@@ -1043,15 +1046,17 @@ export type TeamDelivery =
  * team delivery for `tool`, and its full commit in the team clone. It decides
  * both whether a workflow-launched session may skip its pull and whether a
  * pass records the team revision it ran with, so the two cannot drift
- * (#1176). Read-only, so never userScopeRecord.
+ * (#1176). Read-only, so never userScopeRecord. `beforeOwnPull` is a session
+ * start whose own pull follows and marks what it changes (#1178): a selection
+ * change still waiting for that pull leaves the checkout as delivered until then.
  */
-export async function teamDelivery(localConfig: LocalConfig, tool: string): Promise<TeamDelivery> {
+export async function teamDelivery(localConfig: LocalConfig, tool: string, options: { beforeOwnPull?: boolean } = {}): Promise<TeamDelivery> {
   const state = await loadStateForScope(localConfig);
   const key = await checkoutRecordKey(localConfig);
   const record = key ? state.lastPullByWorkspace?.[key] : undefined;
   const gap = (reason: DeliveryGap): TeamDelivery => ({ complete: false, key, ...(record ? { record } : {}), gap: reason });
   if (!key || !record) return gap('no_record');
-  if (state.lastPullRev === null) return gap('pending_full_sync');
+  if (state.lastPullRev === null && !options.beforeOwnPull) return gap('pending_full_sync');
   if (record.rev === FORCED_FULL_SYNC_REV) return gap('awaiting_full_sync');
   if (!record.delivered) return gap('no_baseline');
   if (!record.targets.includes(tool)) return gap('tool_not_delivered');
@@ -1121,6 +1126,29 @@ function setChildren(record: CheckoutRecord, localConfig: LocalConfig): void {
   if (localConfig.scope !== 'project') return;
   if (localConfig.children) record.children = localConfig.children.fingerprint;
   else delete record.children;
+}
+
+/** The selection `localConfig` makes a pull deliver for, as the checkout's record keeps it. */
+export function deliverySelection(localConfig: LocalConfig): DeliverySelection {
+  const { scope, primaryRole, additionalRoles, roleAssignment, projects, subscribedTags, excludedSkills, inheritUserScope } = localConfig;
+  const lists = Object.entries({ projects, subscribedTags, excludedSkills }).flatMap(([key, values]) => values ? [[key, [...values].sort()]] : []);
+  return DeliverySelectionSchema.parse({
+    scope,
+    ...(primaryRole !== undefined ? { primaryRole } : {}),
+    additionalRoles: [...additionalRoles].sort(),
+    ...(roleAssignment ? { rolesAssigned: true } : {}),
+    ...Object.fromEntries(lists),
+    ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
+  });
+}
+
+/**
+ * The part of a selection that manifest/members.yaml decides (#1186). The rest
+ * changes only through commands that clear lastPullRev; an assignment arrives
+ * with a fetch, so the fast path has to compare this itself.
+ */
+function assignedRolePart(selection: DeliverySelection): Pick<DeliverySelection, 'primaryRole' | 'additionalRoles' | 'rolesAssigned'> {
+  return { primaryRole: selection.primaryRole, additionalRoles: [...selection.additionalRoles].sort(), rolesAssigned: selection.rolesAssigned ?? false };
 }
 
 /** Put `agentModels` on `record`, leaving the key out while there are none. */
@@ -1377,6 +1405,16 @@ async function pullForScope(
     }
     return;
   }
+
+  // manifest/members.yaml lives in the repo the refresh above just moved, so the
+  // roles read when the config loaded are the previous pull's (#1186).
+  // Re-resolving here is what lets a reassignment take effect on the pull that
+  // fetches it, rather than on the one after — by which time this pull has
+  // recorded the new revision as synced and the fast path skips it.
+  // Outside the refresh's try: a failure here is not a failure to fetch.
+  // In place: the hooks, MCP and env stages after this scope reconcile the
+  // object `pull` holds, and key `teamEnvs`/`instructions` on its identity.
+  await refreshRoleAssignment(localConfig);
 
   // Settle the placement records against the tree just refreshed, before
   // delivery reads them: a placement whose PR has merged becomes a record, one
@@ -1720,7 +1758,21 @@ async function pullForScope(
       // commit: the record names the children it delivered (#913).
       const sameChildren = !workspaceKey || state.lastPullByWorkspace?.[workspaceKey]?.children === localConfig.children?.fingerprint;
       if (!sameChildren) log.debug(`[${scopeLabel}] The workspace's children changed, syncing`);
-      if (currentRev && state[revisionField] === currentRev && recorded?.rev === currentRev && recorded.teamRef === localConfig.repo.ref && listed && sameChildren) {
+      const checkout = recordKey ? state.lastPullByWorkspace?.[recordKey] : undefined;
+      // A change in manifest/members.yaml arrives with the fetch and can leave
+      // the checked-out revision where it was — a pinned workspace reads
+      // origin/<default> for it (#1186). A local selection change clears
+      // lastPullRev instead; an assignment has no command to do that, so the
+      // roles the record delivered for gate the fast path: which ones, and
+      // whether the team assigned them, since holding none then filters where
+      // a bare config does not. Only the roles: the rest of the selection is
+      // compared by nothing else either, and a config edited by hand kept the
+      // fast path before. A record without a selection is from an older CLI
+      // and is read as unchanged.
+      const sameRoles = checkout?.selection === undefined
+        || isDeepStrictEqual(assignedRolePart(checkout.selection), assignedRolePart(deliverySelection(localConfig)));
+      if (!sameRoles) log.debug(`[${scopeLabel}] The roles delivered for changed, syncing`);
+      if (currentRev && state[revisionField] === currentRev && recorded?.rev === currentRev && recorded.teamRef === localConfig.repo.ref && listed && sameChildren && sameRoles) {
         currentTargets = await getInstalledResourceTargets(freshConfig, localConfig);
         const previousTargets = recorded.targets;
         const syncedTargets = new Set(previousTargets ?? []);
@@ -1730,7 +1782,6 @@ async function pullForScope(
         // A tool whose skills directory moved (a recorded home changed) is still
         // a target by name: compare the directories too.
         currentPlaces = await placesOf(installOf(freshConfig, localConfig));
-        const checkout = recordKey ? state.lastPullByWorkspace?.[recordKey] : undefined;
         const recordedPlaces = placesRecordOf(checkout);
         if (targetSetMatches && recordedPlaces === undefined) log.debug(`[${scopeLabel}] No record of the skills directories yet, syncing`);
 
@@ -1820,7 +1871,7 @@ async function pullForScope(
           // on the fast path too, or an ordinary pull never surfaces a teammate's
           // learning until `pull --force` (#704).
           await syncLearningsAndRebuildIndex();
-          await syncWorkflows(localConfig, !!options.dryRun, scopeLabel);
+          await syncWorkflows(localConfig, freshConfig, !!options.dryRun, scopeLabel, recorder);
           if (result && result.delivery !== 'failed') result.delivery = 'complete';
           return;
         }
@@ -2391,6 +2442,7 @@ async function pullForScope(
       if (localConfig.scope === 'project' && localConfig.projectRoot) record.root = localConfig.projectRoot;
       if (rootsSeeded) record.rootsSeeded = true;
       setChildren(record, localConfig);
+      record.selection = deliverySelection(localConfig);
       addPushBaseRev(record, deliveredRev);
       record.delivered = ledger.hashes;
       record.places = syncedPlaces;
@@ -2437,6 +2489,7 @@ async function pullForScope(
         ...(claudeMdExcludes ? { claudeMdExcludes } : {}),
       };
       setChildren(record, localConfig);
+      record.selection = deliverySelection(localConfig);
       setAgentModels(record, ledger.agentModels);
       state.lastPullByWorkspace = {
         ...others,
@@ -2494,7 +2547,7 @@ async function pullForScope(
     }
   }
 
-  await syncWorkflows(localConfig, !!options.dryRun, scopeLabel);
+  await syncWorkflows(localConfig, freshConfig, !!options.dryRun, scopeLabel, recorder);
 
   // A real sync ran to completion for this scope. The "Already synced" fast path
   // and every error/skip path return before here, and dry-run is excluded so a
@@ -2875,7 +2928,7 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   log.debug('Auto-migrating hooks to dispatch format...');
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
   if (!teamConfig) return;
-  const { injectHooksToAllTools } = await import('./hooks.js');
+  const { codexTrustPolicy, injectHooksToAllTools } = await import('./hooks.js');
   // Reinject where hooks actually live (resolveHookScope), not resolveBaseDir.
   // The old-format check reads HOME; for a non-self project scope resolveBaseDir
   // → <projectRoot>, so reinjecting there never clears HOME's legacy format and
@@ -2889,16 +2942,25 @@ async function reinjectLegacyHooks(localConfig: LocalConfig): Promise<void> {
   }
   // Paths follow the same scope decision as `baseDir`: a non-self project scope
   // injects into HOME, so it must use the user-scope paths there.
-  await injectHooksToAllTools(hookToolPathsForConfig(teamConfig, localConfig), baseDir, hookFilter, localConfig.toolRoots);
+  await injectHooksToAllTools(hookToolPathsForConfig(teamConfig, localConfig), baseDir, hookFilter, localConfig.toolRoots, codexTrustPolicy(localConfig));
   log.debug('Hooks migrated to dispatch format');
 }
 
-/** Validate workflows without failing this pull when one file is invalid. */
-async function syncWorkflows(localConfig: LocalConfig, dryRun: boolean, scopeLabel: string): Promise<void> {
+/**
+ * Validate workflows, and write a skill for each one an agent may start, without failing this pull when one file is
+ * invalid. The skills it writes are delivered paths (#915).
+ */
+async function syncWorkflows(
+  localConfig: LocalConfig, teamConfig: TeamaiConfig, dryRun: boolean, scopeLabel: string, recorder?: DeliveryRecorder,
+): Promise<void> {
   try {
     const { syncWorkflowDefinitions } = await import('./workflow/cache.js');
     await syncWorkflowDefinitions(localConfig, { dryRun, scopeLabel });
+    if (dryRun) return;
+    const { deployWorkflowSkills } = await import('./workflow/discovery/workflow-skills.js');
+    await deployWorkflowSkills({ teamConfig, localConfig, recorder });
   } catch (error) {
+    recorder?.failed('workflow-skills');
     log.warn(`[${scopeLabel}] Workflows were not updated: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -3296,6 +3358,13 @@ export async function pull(
             await publishPendingRecords(t.opts.selfConfig);
           } catch (e) {
             log.debug(`Workflow record publish to ${t.repoPath} deferred: ${(e as Error).message}`);
+          }
+          // Score labels a submit could not publish (#1085) ride the same drain.
+          try {
+            const { LabelStore } = await import('./scorers/label-store.js');
+            await LabelStore.publish(t.opts.selfConfig);
+          } catch (e) {
+            log.debug(`Score label publish to ${t.repoPath} deferred: ${e instanceof Error ? e.message : String(e)}`);
           }
         }
 
@@ -3822,13 +3891,16 @@ async function trustCodexAllScopes(
 ): Promise<void> {
   if (options.dryRun) return;
   const scopes = [userConfig, projectConfig].filter((c): c is LocalConfig => !!c);
+  let warnedSkew: CodexBuildSkew | undefined;
   for (const localConfig of scopes) {
     try {
       const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
       if (!teamConfig) continue;
       const { reportCodexTrust, trustCodexForScope } = await import('./hooks.js');
       const trust = await trustCodexForScope(teamConfig, localConfig);
-      if (!options.silent) reportCodexTrust(trust, 'problems');
+      const skewAlreadyWarned = trust?.skew !== undefined && isDeepStrictEqual(trust.skew, warnedSkew);
+      if (trust?.skew) warnedSkew = trust.skew;
+      if (!options.silent) reportCodexTrust(skewAlreadyWarned ? { ...trust, skew: undefined } : trust, 'problems');
       else if (trust) log.debug(`[${installScopeName(localConfig.scope)}] Codex trust: ${trust.kind}${'reason' in trust ? ` (${trust.reason})` : ''}`);
     } catch (e) {
       log.debug(`[${installScopeName(localConfig.scope)}] Codex trust skipped: ${(e as Error).message}`);

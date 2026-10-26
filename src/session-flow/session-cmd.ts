@@ -20,6 +20,7 @@
 
 import type { Command } from 'commander';
 import { listAvailablePlatforms, listInstalledPlatforms } from './adapters/index.js';
+import { resumeCommand } from './adapters/platform-facts.js';
 import {
   AgentSession,
   noAdapter,
@@ -27,12 +28,15 @@ import {
   toolRootsLookup,
   writeCopyOnce,
 } from './agent-session.js';
-import { SyncManager, getGitAuthor, defaultSyncMeta, withSessionIndexLock, withSessionPublicationLock } from './sync.js';
+import { SyncManager, getGitAuthor, defaultSyncMeta, withSessionPublicationLock } from './sync.js';
 import { SessionSearchEngine, type LoadedSession } from './search.js';
 import { isSafeSessionFileId } from './ids.js';
 import { isInteractive } from '../utils/prompt.js';
+import { updateReports } from '../utils/reports-branch.js';
 import { registerMigrationCommand } from './session-migrate-cmd.js';
 import {
+  REPORTS_ARCHIVE_BUSY,
+  archiveToReports,
   ask,
   authorForCwd,
   closeStdin,
@@ -40,7 +44,7 @@ import {
   deriveArchiveIdentity,
   listedCounts,
   listSource,
-  mergeBusyMessage,
+  pullArchive,
   pushToRemote,
   reportArchiveBusy,
   resolveRepoIdentity,
@@ -95,7 +99,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
     .command('push')
     .description('Push local sessions to the team repo')
     .option('--source <platform>', 'Source platform to read sessions from')
-    .option('--repo-root <path>', 'Team repo root (defaults to cwd)')
+    .option('--repo-root <path>', 'Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)')
     .option('--cwd <path>', 'Working directory (defaults to current directory)')
     .option('--limit <n>', 'Max sessions to push (default: 5; ignored with --all)', '5')
     .option('--all', 'Push every session of the platform across all workspace directories (ignores --limit)')
@@ -110,7 +114,8 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         process.exit(1);
       }
       const workCwd = opts.cwd ?? process.cwd();
-      const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
+      const archive = await resolveRepoRoot(opts.repoRoot, { dryRun: isDryRun() });
+      const { root: repoRoot, reports } = archive;
       const author = getGitAuthor(workCwd);
       // --all: no workspace lists every workspace directory of that platform (P5).
       // The blast radius stays on a single platform (same as status --all); single-cwd mode keeps the old behavior.
@@ -172,9 +177,10 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         return;
       }
 
-      const publication = await withSessionPublicationLock(repoRoot, async () => {
-        const syncMgr = new SyncManager(repoRoot);
-        const toolRootsFor = toolRootsLookup();
+      const toolRootsFor = toolRootsLookup();
+      const commitMessage = (saved: number) => `sync: push ${saved} session(s) from ${source}${opts.all ? ' (all workspaces)' : ''}`;
+      /** Saves the selected sessions into the archive at `root`: how many, or undefined once a failure that stops the push was reported. */
+      const archiveInto = async (syncMgr: SyncManager, root: string): Promise<number | undefined> => {
         let saved = 0;
         let unreadable = 0;
         let redactedTotal = 0;
@@ -213,15 +219,15 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
           // mid-batch must not fall through to a commit that publishes a
           // half-archive.
           try {
-            const write = await withSessionIndexLock(repoRoot, async () => syncMgr.saveSession(session, meta));
+            const write = await syncMgr.saveSession(session, meta);
             if (write.status === 'busy') {
-              reportArchiveBusy(repoRoot, write.lockPath);
-              return;
+              reportArchiveBusy(root, write.lockPath);
+              return undefined;
             }
           } catch (err) {
             console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
             process.exitCode = 1;
-            return;
+            return undefined;
           }
           saved++;
         }
@@ -236,9 +242,41 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
             '  ⚠ Archived as-is: full transcripts (possibly secrets/paths) are team-readable. Use --scrub to redact.',
           );
         }
+        return saved;
+      };
+      // Archive changes and their Git publication are serialized per team repo, the teamai-reports archive included.
+      const publication = await withSessionPublicationLock(repoRoot, async () => {
+        if (reports) {
+          const archived = await archiveToReports(reports, archiveInto, commitMessage);
+          switch (archived.status) {
+            case 'busy':
+              console.error(`Error: ${REPORTS_ARCHIVE_BUSY}`);
+              process.exitCode = 1;
+              return;
+            case 'stopped':
+              return;
+            case 'published':
+              console.log(`\n  ✓ Pushed ${archived.saved} session(s) from ${source}\n`);
+              return;
+            case 'already-present':
+              console.log(`\n  · No changes to push\n`);
+              return;
+            case 'failed':
+              console.error(`\n  ✗ ${archived.saved} session(s) not pushed to teamai-reports: ${safeText(archived.reason)}`);
+              process.exitCode = 1;
+              return;
+            default: {
+              const unhandled: never = archived;
+              return unhandled;
+            }
+          }
+        }
+        const syncMgr = new SyncManager(repoRoot);
+        const saved = await archiveInto(syncMgr, repoRoot);
+        if (saved === undefined) return;
         // [fixed] a gitCommit failure (not a git directory / index.lock race) used to crash with a raw stack trace
         const commit = runGitStep(
-          () => syncMgr.gitCommit(`sync: push ${saved} session(s) from ${source}${opts.all ? ' (all workspaces)' : ''}`),
+          () => syncMgr.gitCommit(commitMessage(saved)),
           repoRoot,
           'git commit',
         );
@@ -270,71 +308,85 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
   sessionCmd
     .command('pull')
     .description('Pull team sessions for the current project')
-    .option('--repo-root <path>', 'Team repo root (defaults to cwd)')
+    .option('--repo-root <path>', 'Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)')
     .option('--cwd <path>', 'Working directory (defaults to current directory)')
     .option('--all', 'Rebuild indexes for every repo in the team repo (not just the current project)')
     .action(async (opts) => {
       const workCwd = opts.cwd ?? process.cwd();
-      const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
+      const archive = await resolveRepoRoot(opts.repoRoot, { dryRun: isDryRun() });
+      const { root: repoRoot, reports } = archive;
 
-      const syncMgr = new SyncManager(repoRoot);
       if (isDryRun()) {
         console.log(`Dry-run: would pull from the team repo remote and rebuild indexes (repo root: ${repoRoot}).`);
         return;
       }
-      const publication = await withSessionPublicationLock(repoRoot, async () => {
-        // [fixed] a gitPull failure (no remote / repoRoot does not exist) used to crash with a raw stack trace
-        const finishIndexMerge = async (indexes: string[]): Promise<void> => {
-          // The rebuild takes the lock and the network pull does not: a lock held across it would make other saves wait and fail busy.
-          const merged = await withSessionIndexLock(repoRoot, async () =>
-            syncMgr.commitRebuiltIndexes(indexes).catch((error: unknown) =>
-              runGitStep(() => { throw error; }, repoRoot, 'git pull')),
-          );
-          if (merged.status === 'busy') {
-            console.error(`Error: ${mergeBusyMessage(repoRoot, merged.lockPath)}`);
-            process.exit(1);
-          }
-          console.log(`  ✓ Merged remote sessions and rebuilt ${indexes.length} conflicted session index(es)`);
-        };
-        let pulled = runGitStep(() => syncMgr.gitPull(), repoRoot, 'git pull');
-        // A merge an earlier pull left on the session indexes is finished first; it does not replace this pull.
-        if (pulled.status === 'indexes-conflicted' && pulled.pending) {
-          await finishIndexMerge(pulled.indexes);
-          pulled = runGitStep(() => syncMgr.gitPull(), repoRoot, 'git pull');
-        }
-        if (pulled.status === 'stopped') {
+      /** Pulls the archive at `root` and rebuilds its indexes: false once the pull itself failed and said why; a busy rebuild sets the exit code instead. */
+      const pullInto = async (root: string): Promise<boolean> => {
+        const syncMgr = new SyncManager(root);
+        const pulled = await pullArchive(syncMgr, root);
+        if (pulled.status === 'failed') {
           console.error(`Error: ${pulled.reason}`);
-          process.exit(1);
+          return false;
         }
-        if (pulled.status === 'indexes-conflicted') await finishIndexMerge(pulled.indexes);
+        if (pulled.rebuilt > 0) console.log(`  ✓ Merged remote sessions and rebuilt ${pulled.rebuilt} conflicted session index(es)`);
         if (opts.all) {
           // P2: rebuild by directory (including repos whose index is missing or corrupt — those are exactly the ones that most need repair),
           // rather than only rebuilding the ones whose identity can be recovered from _index.json.
-          const rebuilt = await withSessionIndexLock(repoRoot, async () => syncMgr.rebuildAllIndexes());
-          if (rebuilt.status === 'busy') return reportArchiveBusy(repoRoot, rebuilt.lockPath);
+          const rebuilt = await syncMgr.rebuildAllIndexes();
+          if (rebuilt.status === 'busy') {
+            reportArchiveBusy(root, rebuilt.lockPath);
+            return true;
+          }
           const { repos, sessions } = rebuilt.value;
           console.log(`\n  ✓ Pulled and indexed ${sessions} session(s) across ${repos} repo(s)\n`);
         } else {
           const repoIdentity = resolveRepoIdentity(workCwd);
-          const rebuilt = await withSessionIndexLock(repoRoot, async () => syncMgr.rebuildIndex(repoIdentity));
-          if (rebuilt.status === 'busy') return reportArchiveBusy(repoRoot, rebuilt.lockPath);
+          const rebuilt = await syncMgr.rebuildIndex(repoIdentity);
+          if (rebuilt.status === 'busy') {
+            reportArchiveBusy(root, rebuilt.lockPath);
+            return true;
+          }
           console.log(`\n  ✓ Pulled and indexed ${rebuilt.value} session(s)\n`);
         }
+        return true;
+      };
+      // Archive changes and their Git publication are serialized per team repo, the teamai-reports archive included.
+      const publication = await withSessionPublicationLock(repoRoot, async (): Promise<boolean> => {
+        if (!reports) return pullInto(repoRoot);
+        // Pulling merges into the teamai-reports checkout, so it runs under the lock every writer there takes.
+        let pulled = true;
+        const result = await updateReports(reports, async (worktree) => {
+          pulled = await pullInto(worktree);
+          return null;
+        });
+        if (result.status === 'busy') {
+          console.error('Error: Another teamai command is writing teamai-reports, so nothing was pulled. Run this command again once it has finished.');
+          process.exitCode = 1;
+          return true;
+        }
+        if (result.status === 'failed') {
+          console.error(`Error: ${safeText(result.reason)}`);
+          process.exitCode = 1;
+          return true;
+        }
+        return pulled;
       });
       if (publication.status === 'busy') reportArchiveBusy(repoRoot, publication.lockPath);
+      else if (!publication.value) process.exit(1);
     });
 
   // ── session list ───────────────────────────────────────────
   sessionCmd
     .command('list')
     .description('List team sessions for the current project')
-    .option('--repo-root <path>', 'Team repo root (defaults to cwd)')
+    .option('--repo-root <path>', 'Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)')
     .option('--cwd <path>', 'Working directory (defaults to current directory)')
     .option('--author <name>', 'Filter by author')
     .option('--all', 'List sessions across all projects in the team repo (not just the current one)')
     .action(async (opts) => {
       const workCwd = opts.cwd ?? process.cwd();
-      const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
+      const archive = await resolveRepoRoot(opts.repoRoot, { dryRun: isDryRun(), read: true });
+      const { root: repoRoot } = archive;
       const repoIdentity = resolveRepoIdentity(workCwd);
 
       const syncMgr = new SyncManager(repoRoot);
@@ -388,7 +440,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
     // The option is named --platform rather than --in: aligned with rollback's --platform,
     // and with the noun-style naming of the rest of this project's commands (--source / --target / --agent / --role).
     .requiredOption('--platform <platform>', 'Target platform to restore into')
-    .option('--repo-root <path>', 'Team repo root (defaults to cwd)')
+    .option('--repo-root <path>', 'Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)')
     .option('--cwd <path>', 'Working directory for the restored session (defaults to current directory)')
     .option('--author <name>', 'Author of the session (if ambiguous)')
     .action(async (sessionName, opts) => {
@@ -399,7 +451,8 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
         return;
       }
       const workCwd = opts.cwd ?? process.cwd();
-      const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
+      const archive = await resolveRepoRoot(opts.repoRoot, { dryRun: isDryRun(), read: true });
+      const { root: repoRoot } = archive;
       const repoIdentity = resolveRepoIdentity(workCwd);
 
       const syncMgr = new SyncManager(repoRoot);
@@ -438,7 +491,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       if (write.reused) {
         console.log(`\n  ✓ Session already restored as ${write.sessionId}, nothing written.`);
         console.log(`  CWD: ${resumeCwd}`);
-        console.log(`\n  To continue: ${opts.platform} --resume ${write.sessionId}\n`);
+        console.log(`\n  To continue: ${resumeCommand(opts.platform, write.sessionId)}\n`);
         return;
       }
 
@@ -450,7 +503,7 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
       console.log(`  Session ID: ${newSessionId}`);
       console.log(`  Messages: ${session.messages.length}`);
       console.log(`  CWD: ${resumeCwd}`);
-      console.log(`\n  To continue: ${opts.platform} --resume ${newSessionId}\n`);
+      console.log(`\n  To continue: ${resumeCommand(opts.platform, newSessionId)}\n`);
     });
 
   // ── session search ─────────────────────────────────────────
@@ -458,13 +511,14 @@ export function registerSessionFlowCommands(sessionCmd: Command): void {
     .command('search')
     .description('Search team session content')
     .argument('<query>', 'Search query')
-    .option('--repo-root <path>', 'Team repo root (defaults to cwd)')
+    .option('--repo-root <path>', 'Team repo clone that holds the session archive (default: the teamai install for this directory, else your user install)')
     .option('--cwd <path>', 'Working directory (defaults to current directory)')
     .option('--limit <n>', 'Max results (default: 10)', '10')
     .option('--all', 'Search across all projects (not just current)')
     .action(async (query, opts) => {
       const workCwd = opts.cwd ?? process.cwd();
-      const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
+      const archive = await resolveRepoRoot(opts.repoRoot, { dryRun: isDryRun(), read: true });
+      const { root: repoRoot } = archive;
       const repoIdentity = resolveRepoIdentity(workCwd);
       const limitRaw = parseInt(opts.limit, 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 10;

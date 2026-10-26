@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { createLocalToolAdapter, type ToolSpawn } from '../workflow/local-tool-adapter.js';
+import { createLocalToolAdapter, type ToolSpawn } from '../workflow/drivers/local/local-tool-adapter.js';
 
 const files: string[] = [];
 
@@ -87,6 +87,17 @@ describe('local tool adapter', () => {
       output: { ok: true },
       tokens: { input: 999, output: 999 },
     });
+  });
+
+  it('passes maxTurns to headless Claude as --max-turns', async () => {
+    const resultPath = path.join(os.tmpdir(), `teamai-workflow-turns-${Date.now()}.json`);
+    files.push(resultPath);
+    const spawnTool = vi.fn(() => child(claudeStream('claude-sonnet', { result: JSON.stringify({ ok: true }) }))) as unknown as ToolSpawn;
+    const adapter = createLocalToolAdapter(spawnTool, () => 'claude');
+
+    await adapter.run('claude', { prompt: 'Plan.', cwd: os.tmpdir(), resultPath, maxTurns: 3 });
+
+    expect(spawnTool).toHaveBeenCalledWith('claude', expect.arrayContaining(['-p', '--max-turns', '3']), expect.anything());
   });
 
   it('writes the Claude stdout fallback when the tool does not write result.json', async () => {

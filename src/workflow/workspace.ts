@@ -2,13 +2,15 @@
  * Workspace planning. The engine names the branch and lists the commits to merge.
  * A driver creates the worktree. This module does not run git.
  */
+import { z } from 'zod';
+import { sameDriver } from '../driver-identity.js';
 import { itemsAfter, itemsOf } from './fan-out.js';
 import { localId, statesIn, stepDefinitions, type Scope } from './scope.js';
 import { parseStepPath } from './step-path.js';
-import { passOf, type StepState } from './step-state.js';
-import type { DriverIdentity, RunState, WorkflowFailure, WorkflowStep } from './types.js';
+import { passOf, type Delivery, type StepState } from './step-state.js';
+import type { DriverIdentity, RunState, WorkflowDefinition, WorkflowFailure, WorkflowStep, WORKSPACE_MODES } from './types.js';
 
-export type WorkspaceMode = 'read-only' | 'new' | 'continue';
+export type WorkspaceMode = typeof WORKSPACE_MODES[number];
 
 /** What a driver reports for a step that ran in a change branch. */
 export interface StepChanges {
@@ -34,17 +36,37 @@ export type WorkspaceContract = {
   | { mode: 'read-only'; merge: [] }
 );
 
+const ContractFields = {
+  base: z.object({ ref: z.string().optional(), commit: z.string() }),
+  configCommit: z.string(),
+  branch: z.string(),
+  start: z.object({ commit: z.string(), branch: z.string().optional() }),
+};
+
+export const WorkspaceContractSchema = z.discriminatedUnion('mode', [
+  z.object({ ...ContractFields, mode: z.enum(['new', 'continue']), merge: z.array(z.object({ branch: z.string(), commit: z.string() })) }),
+  z.object({ ...ContractFields, mode: z.literal('read-only'), merge: z.tuple([]) }),
+]) satisfies z.ZodType<WorkspaceContract>;
+
 export interface SessionRef {
   tool: string;
   id: string;
 }
 
+/** The session a lease resumes, with the sessions it continued, newest first, for a driver that cannot resume it. */
+export interface LeaseSession extends SessionRef {
+  earlier?: SessionRef[];
+}
+
 export interface WorkspacePlan {
   mode: WorkspaceMode;
   contract?: WorkspaceContract;
-  session?: SessionRef;
-  /** The step stays pending. `next` does not hand it to this driver. */
-  defer?: string;
+  session?: LeaseSession;
+  /**
+   * The step stays pending. `next` does not hand it to this driver: it lacks the workspace mode `needs`, or, without
+   * `needs`, another driver owns the copy.
+   */
+  defer?: { reason: string; needs?: WorkspaceMode };
   fail?: WorkflowFailure;
 }
 
@@ -74,13 +96,72 @@ export function resolveMode(step: WorkflowStep, ancestors: WorkflowStep[]): Work
   return 'read-only';
 }
 
+/** Whether a step runs in the member's checkout as it is: read-only, with no enclosing step that opens a copy. */
+export function runsInCheckout(step: WorkflowStep, ancestors: WorkflowStep[]): boolean {
+  return resolveMode(step, ancestors) === 'read-only' && !ancestors.some(opensCopy);
+}
+
+/**
+ * Why a run of `definition` cannot deliver what its steps declare, or undefined when it can. A step in a sub-workflow
+ * continues the copy of the step that runs it, so this reads the whole tree a run executes, which one file cannot.
+ * `base` is the checkout the run starts from: a pull request targets a branch, and a detached HEAD has none.
+ */
+export function deliveryProblem(
+  definition: WorkflowDefinition, workflows: Record<string, WorkflowDefinition>, base: RunState['base'],
+): WorkflowFailure | undefined {
+  let delivering: string | undefined;
+  const childOf = (step: WorkflowStep) => (typeof step.workflow === 'string' ? workflows[step.workflow] : step.workflow);
+  const writes = (steps: WorkflowStep[], ancestors: WorkflowStep[]): boolean => steps.some((step) => {
+    const child = childOf(step);
+    if (child) return writes(child.steps, [...ancestors, step]);
+    return (step.prompt !== undefined || step.promptFile !== undefined || step.workspace === 'new' || step.workspace === 'continue')
+      && resolveMode(step, ancestors) !== 'read-only';
+  });
+  const visit = (steps: WorkflowStep[], ancestors: WorkflowStep[], prefix: string): WorkflowFailure | undefined => {
+    for (const step of steps) {
+      const path = `${prefix}${step.id}`;
+      const child = childOf(step);
+      if (step.deliver === 'pr') {
+        delivering ??= path;
+        if (step.workflow !== undefined && step.workspace !== 'new' && !step.forEach) {
+          return { code: 'bad_delivery', message: `Step "${path}" delivers its workflow, so it needs workspace: new to own the branch it delivers.` };
+        }
+        if (child && !writes(child.steps, [...ancestors, step])) {
+          return { code: 'bad_delivery', message: `Step "${path}" has deliver: pr, but no step of the workflow it runs writes a branch, so it would deliver nothing. Set workspace: new on "${path}" so its prompt steps write, or give a step in that workflow workspace: new or continue.` };
+        }
+        if (step.workflow === undefined && resolveMode(step, ancestors) === 'read-only') {
+          return { code: 'bad_delivery', message: `Step "${path}" has deliver: pr but runs read-only. Set workspace: new on it, or on the workflow step that runs it.` };
+        }
+      }
+      const problem = child && visit(child.steps, [...ancestors, step], `${path}.`);
+      if (problem) return problem;
+    }
+    return undefined;
+  };
+  const problem = visit(definition.steps, [], '');
+  if (problem || delivering === undefined || !base || base.ref !== undefined) return problem;
+  return {
+    code: 'no_base_branch',
+    message: `Step "${delivering}" delivers a pull request, but the run would start from a detached HEAD at ${base.commit}, so no branch is there for the pull request to target. Check out a named branch, then start the run again.`,
+  };
+}
+
+/** How step instance `path` runs, or undefined when the run's definitions have no such step. */
+export function stepMode(run: StepTree, path: string): WorkspaceMode | undefined {
+  const definition = stepDefinitions(run)(path);
+  return definition && resolveMode(definition, ancestorsOf(run, path).map((ancestor) => ancestor.step));
+}
+
 interface Ancestor {
   instance: string;
   step: WorkflowStep;
   pass: number;
 }
 
-function ancestorsOf(run: RunState, path: string): Ancestor[] {
+/** What finding a step's workspace reads of a run: its definitions, and the pass of each step instance. */
+type StepTree = Pick<RunState, 'definition' | 'workflows'> & { steps: readonly { id: string; pass?: number }[] };
+
+function ancestorsOf(run: StepTree, path: string): Ancestor[] {
   const definitionOf = stepDefinitions(run);
   const segments = parseStepPath(path);
   const ancestors: Ancestor[] = [];
@@ -101,6 +182,69 @@ function changesOf(state: StepState | undefined): StepChanges | undefined {
   return state.changes;
 }
 
+/**
+ * What a step that just succeeded delivers, or undefined when its branch holds nothing beyond the run base. A leaf
+ * delivers the branch it reported. A workflow step delivers its own copy once, never per step inside it; one without a
+ * copy of its own, such as a `for_each` item that runs a workflow, delivers the branch its latest step wrote.
+ */
+export function deliverableOf(run: RunState, state: StepState, step: WorkflowStep, changes?: StepChanges): Omit<Delivery, 'reported'> | undefined {
+  let branch = changes?.branch;
+  let head = changes?.to;
+  if (step.workflow !== undefined) {
+    branch = workflowBranch(run, state);
+    head = branch === undefined ? undefined : run.copies?.[branch]?.commit;
+  }
+  return branch === undefined || head === undefined || head === run.base?.commit ? undefined : { branch, head };
+}
+
+/** The branch workflow step `state` delivers: its own copy, else the branch its latest step wrote. */
+function workflowBranch(run: RunState, state: StepState): string | undefined {
+  const own = branchName(run.id, state.id, state.pass ?? 1);
+  if (run.copies?.[own]?.commit !== undefined) return own;
+  const latest = run.steps.filter((item) => item.id.startsWith(`${state.id}.`) && item.status !== 'cancelled' && changesOf(item))
+    .sort((left, right) => ('settledAt' in right ? right.settledAt : 0) - ('settledAt' in left ? left.settledAt : 0))[0];
+  return changesOf(latest)?.branch;
+}
+
+/**
+ * Work a step inside workflow step `state` wrote beyond the run base, when `state` delivers nothing of its own: no
+ * pull request would hold it. Undefined when there is none.
+ */
+export function workLeftUndelivered(run: RunState, state: StepState): { branch: string; head: string; child: { step: string; branch: string } } | undefined {
+  const branch = workflowBranch(run, state);
+  const base = run.base?.commit;
+  if (branch === undefined || base === undefined) return undefined;
+  const child = childWorkOff(run, state, branch).find((item) => item.commit !== base);
+  return child && { branch, head: base, child };
+}
+
+/**
+ * The work steps inside `state` that succeeded left on other branches than `branch`, the one `state` delivers, which no
+ * step inside it delivers: a pull request of `branch` leaves out any of it that `branch` does not hold.
+ */
+export function childWorkOff(run: RunState, state: StepState, branch: string): Array<{ step: string; branch: string; commit: string }> {
+  const inside = run.steps.filter((item) => item.id.startsWith(`${state.id}.`) && item.status === 'succeeded');
+  const delivered = new Set(inside.flatMap((item) => ('delivery' in item && item.delivery ? [item.delivery.branch] : [])));
+  return inside.flatMap((item) => {
+    const changes = changesOf(item);
+    return changes && changes.branch !== branch && !delivered.has(changes.branch) ? [{ step: item.id, branch: changes.branch, commit: changes.to }] : [];
+  });
+}
+
+/**
+ * The branch a pull request from `branch` goes into: the nearest branch it grew from that delivered a pull request, so
+ * the request holds only the work done since, else the run base branch. Undefined when the run started from no branch.
+ */
+export function deliveryTarget(run: Pick<RunState, 'base' | 'copies' | 'deliveries'>, branch: string): string | undefined {
+  const delivered = new Set((run.deliveries ?? []).map((receipt) => receipt.branch));
+  const walked = new Set([branch]);
+  for (let from = run.copies?.[branch]?.from; from !== undefined && !walked.has(from); from = run.copies?.[from]?.from) {
+    if (delivered.has(from)) return from;
+    walked.add(from);
+  }
+  return run.base?.ref;
+}
+
 /** Direct steps of a workflow step, such as `work.write`, not its fan-out items. */
 function workflowChildren(run: RunState, step: StepState): StepState[] {
   const prefix = `${step.id}.`;
@@ -114,13 +258,26 @@ function workflowChildren(run: RunState, step: StepState): StepState[] {
 /** Branches a step merges, `after` items first, then its other needs. An omitted `needs` uses the parent step's needs. */
 function mergeChanges(run: RunState, scope: Scope, state: StepState, definition: WorkflowStep): StepChanges[] {
   const ordered: Array<{ changes: StepChanges; settledAt: number }> = [];
+  const visited = new Set<string>();
   const push = (step: StepState | undefined): void => {
-    if (!step) return;
+    if (!step || visited.has(step.id)) return;
+    visited.add(step.id);
     const changes = changesOf(step);
     // A for_each step keeps each item's branch on that item, and a workflow step keeps each child's on that child.
     if (!changes) {
       for (const item of itemsOf(run, step)) push(item);
       for (const child of workflowChildren(run, step)) push(child);
+      // A skipped or read-only need wrote no branch, but its earlier dependencies still supply the copy's origin.
+      let id: string | undefined = step.id;
+      while (id) {
+        const defined = stepDefinitions(run)(id);
+        const prefix: string = id.includes('.') ? id.slice(0, id.lastIndexOf('.') + 1) : '';
+        if (defined?.needs !== undefined) {
+          for (const need of defined.needs) push(run.steps.find((item) => item.id === `${prefix}${need}`));
+          break;
+        }
+        id = prefix ? prefix.slice(0, -1) : undefined;
+      }
       return;
     }
     const settledAt = 'settledAt' in step ? step.settledAt : 0;
@@ -216,11 +373,32 @@ function sessionFromPasses(passes: Array<{ tool?: string; session?: string }>): 
   return undefined;
 }
 
-function sessionOf(run: RunState, scope: Scope, state: StepState, definition: WorkflowStep): SessionRef | WorkflowFailure | undefined {
+/** Where `session` stands now: the copy the latest step that continued it under another id left, and so on from there. */
+function latestContinuation(run: RunState, session: SessionRef | undefined): LeaseSession | undefined {
+  if (!session) return undefined;
+  const latestFirst = [...(run.sessionContinuations ?? [])].reverse();
+  let latest = session;
+  const earlier: SessionRef[] = [];
+  // At most one hop per link, so links a driver reported in a circle still end.
+  for (let hop = 0; hop < latestFirst.length; hop += 1) {
+    const from = latest;
+    const next = latestFirst.find((link) => link.from.tool === from.tool && link.from.id === from.id);
+    if (!next) break;
+    earlier.unshift(from);
+    latest = next.to;
+  }
+  return { tool: latest.tool, id: latest.id, ...(earlier.length > 0 ? { earlier } : {}) };
+}
+
+/**
+ * The session a step resumes: its own latest with `session: continue`, or the latest of the step `session.from` names,
+ * as later steps that continued it left it.
+ */
+export function sessionOf(run: RunState, scope: Scope, state: StepState, definition: WorkflowStep): LeaseSession | WorkflowFailure | undefined {
   if (!definition.session) return undefined;
   if ('continue' in definition.session) {
     const archived = (run.archive ?? []).filter((entry) => entry.step === state.id);
-    return sessionFromPasses([...archived, ...(state.passes ?? [])]);
+    return latestContinuation(run, sessionFromPasses([...archived, ...(state.passes ?? [])]));
   }
   const name = definition.session.from;
   const states = statesIn(run, scope);
@@ -239,11 +417,7 @@ function sessionOf(run: RunState, scope: Scope, state: StepState, definition: Wo
     return { code: 'bad_session', message: `step "${state.id}" resumes "${name}", which is a for_each step` };
   }
   const current = passOf(target);
-  return sessionFromPasses([...(target.passes ?? []), ...(current ? [current] : [])]);
-}
-
-function sameDriver(left: DriverIdentity, right: DriverIdentity): boolean {
-  return left.kind === right.kind && left.machine === right.machine && left.workspace === right.workspace;
+  return latestContinuation(run, sessionFromPasses([...(target.passes ?? []), ...(current ? [current] : [])]));
 }
 
 export interface WorkspaceRequest {
@@ -283,21 +457,21 @@ export function planWorkspace(
     const needed = heads.length === 1 ? heads[0] : undefined;
     const branch = needed?.branch ?? branchName(run.id, owner.instance, owner.pass);
     if (!handback && !modes.includes('continue')) {
-      return { mode, defer: `step "${state.id}" reads workspace ${branch}, which needs continue` };
+      return { mode, defer: { reason: `step "${state.id}" reads workspace ${branch}, which needs continue`, needs: 'continue' } };
     }
     const base = run.base ?? request.base;
     if (!base) {
       return { mode, fail: { code: 'workspace_base', message: `step "${state.id}" needs the run's base commit` } };
     }
     const copy = run.copies?.[branch];
-    if (!handback && copy && !sameDriver(copy.owner, request.driver)) {
-      return { mode, defer: `step "${state.id}" reads a workspace owned by another driver` };
+    if (!handback && copy?.owner && !sameDriver(copy.owner, request.driver)) {
+      return { mode, defer: { reason: `step "${state.id}" reads a workspace owned by another driver` } };
     }
     const start = { commit: copy?.commit ?? needed?.commit ?? base.commit };
     return { mode, ...session, contract: { mode, base, configCommit: base.commit, branch, start, merge: [] } };
   }
   if (!handback && !modes.includes(mode)) {
-    return { mode, defer: `step "${state.id}" needs workspace ${mode}, which this driver does not provide` };
+    return { mode, defer: { reason: `step "${state.id}" needs workspace ${mode}, which this driver does not provide`, needs: mode } };
   }
   const base = run.base ?? request.base;
   if (!base) {
@@ -310,8 +484,8 @@ export function planWorkspace(
     return { mode, fail: { code: 'workspace_base', message: `step "${state.id}" continues a workspace, but no enclosing step opens one` } };
   }
   const copy = run.copies?.[branch];
-  if (!handback && copy && !sameDriver(copy.owner, request.driver)) {
-    return { mode, defer: `step "${state.id}" continues a workspace owned by another driver` };
+  if (!handback && copy?.owner && !sameDriver(copy.owner, request.driver)) {
+    return { mode, defer: { reason: `step "${state.id}" continues a workspace owned by another driver` } };
   }
   const changes = mergeChanges(run, scope, state, definition);
   const [first, ...rest] = mode === 'new' ? changes : [];
@@ -330,7 +504,7 @@ export function planWorkspace(
 }
 
 /** Whether the steps inside `step` run in a copy it opens rather than in the one around it. */
-function opensCopy(step: WorkflowStep): boolean {
+export function opensCopy(step: WorkflowStep): boolean {
   return step.workspace === 'new' || (step.forEach !== undefined && step.workspace === 'continue');
 }
 

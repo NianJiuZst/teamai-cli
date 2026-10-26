@@ -103,6 +103,32 @@ function makeUserSandbox(toolDirs: string[], options: { rule?: boolean } = {}): 
 
 const PROJECT_AGENTS_MD = '# Project\n\nAuthored project instructions.\n';
 
+it('pulls Pi rules and instructions into the existing override and preserves personal text on uninstall', async () => {
+  const { sandbox, home } = makeUserSandbox(['.pi/agent'], { rule: true });
+  const normal = path.join(home, '.pi/agent/AGENTS.md');
+  const override = path.join(home, '.pi/agent/AGENTS.override.md');
+  fs.writeFileSync(normal, `# Personal normal\n\n${CULTURE_START}\nOLD-CULTURE\n${CULTURE_END}\n`);
+  fs.writeFileSync(override, '# Personal override\n');
+  try {
+    const pull = await runCLI(['pull', '--force'], { HOME: home }, home);
+    expect(pull.code, pull.output).toBe(0);
+    const doctor = await runCLI(['doctor'], { HOME: home }, home);
+    expect(doctor.code, doctor.output).toBe(0);
+    expect(pull.output).not.toContain('pi does not read');
+    const read = fs.readFileSync(override, 'utf8');
+    expect(read).toContain('# Personal override');
+    expect(read).toContain('Be kind.');
+    expect(read).toContain('Shared team instructions.');
+    expect(read).toContain('RULE-SENTINEL');
+    expect(fs.readFileSync(normal, 'utf8')).toBe('# Personal normal\n');
+    const uninstall = await runCLI(['uninstall', '--force'], { HOME: home }, home);
+    expect(uninstall.code, uninstall.output).toBe(0);
+    expect(fs.readFileSync(override, 'utf8')).toBe('# Personal override\n');
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
 /**
  * A team whose roles select different `claudemd/` namespaces, and a project
  * repo with an authored, committed AGENTS.md (#945).
@@ -209,6 +235,32 @@ function memberData(member: ProjectMember): { config: string; teamRepo: string }
 
 const pullAs = (member: ProjectMember, args: string[] = [], env: Record<string, string> = {}): Promise<RunResult> =>
   runCLI(['pull', '--force', ...args], { HOME: member.home, ...env }, member.projectRoot);
+
+it('doctor detects oversized ZCode project rule replies and honors a larger configured byte cap', async () => {
+  const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-zcode-budget-')));
+  try {
+    const fixture = makeTeamAndProject(sandbox, { files: { 'rules/common.md': '界'.repeat(11_000) } });
+    const member = makeProjectMember(sandbox, fixture, 'pm', 'product', ['.zcode']);
+    const pulled = await pullAs(member);
+    expect(pulled.code, pulled.output).toBe(0);
+    const doctor = async () => {
+      const result = await runCLI(['doctor', '--json'], { HOME: member.home }, member.projectRoot);
+      const report = JSON.parse(result.stdout) as { checks: Array<{ name: string; ok: boolean; fix?: string }> };
+      return report.checks.find(check => check.name === 'Project rules fit the zcode hook stdout budget');
+    };
+    const failed = await doctor();
+    expect(failed?.ok).toBe(false);
+    expect(failed?.fix).toContain('UTF-8');
+    expect(failed?.fix).toContain('32768');
+    const file = path.join(member.home, '.zcode/cli/config.json');
+    const config = JSON.parse(fs.readFileSync(file, 'utf8'));
+    config.hooks.maxOutputBytes = 65_536;
+    fs.writeFileSync(file, JSON.stringify(config));
+    expect((await doctor())?.ok).toBe(true);
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
 
 describe('instruction block targets on real CLI pull (#945)', () => {
   const sandboxes: string[] = [];

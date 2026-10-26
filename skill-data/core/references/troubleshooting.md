@@ -188,6 +188,8 @@ command in the line; do not choose for them.
 
 Muse may omit `type` when saving a stdio server. Pull and removal compare that form separately from the document they write, so a change to one server leaves personal servers and unchanged managed entries as saved.
 
+Muse key reordering alone is not a user edit. Removal uses a content fingerprint for new records; a legacy record needs a matching original rendered hash and value from team Git history. Without that proof it keeps the server and warns. Real command, args, env or header edits remain personal.
+
 ## "Did not write <tool>'s MCP servers to <file>" / `withheld:`
 
 `pull` prints this, and `teamai mcp list` (`withheld:`) and `teamai doctor`
@@ -287,9 +289,12 @@ Codex runs a non-managed hook only once it is **trusted**. `teamai init`, `pull`
 and `teamai hooks inject` trust the hooks they write (and, in a project, the main
 checkout, or the current worktree when Git cannot locate a main checkout) through `codex app-server`.
 Trust written by a session-start pull applies from the next Codex session. `teamai doctor` names any teamai hook Codex will not
-run. Then: run `teamai pull`; if `codex` is not on PATH or `codexTrustEnabled: false`
+run. Then: run `teamai pull`; if teamai finds no Codex (neither `codex` on PATH nor
+the desktop app's bundled one) or `codexTrustEnabled: false`
 is set in `config.yaml`, guide the user to trust the teamai hooks in Codex `/hooks`,
-then reopen a session. A new linked worktree gets the team hooks from its second
+then reopen a session. When pull or doctor says `Codex builds disagree:`, teamai trusted
+with the newest build and the older one skips the hooks it hashes differently: have the
+user update or remove the older build it names, then run `teamai pull`. A new linked worktree gets the team hooks from its second
 Codex session (the first creates its `.codex/`). Member hooks with the same command
 are preserved and remain untouched by automatic trust. Codex ownership uses the
 recorded event, position and complete entry. A moved entry is recovered only by a
@@ -346,7 +351,7 @@ A recalled doc is upvoted once per session when the session that ran the recall
 opens it within 24 hours: a file read, a reader command (`cat`, `sed -n`, …), or
 a search whose output shows its lines. Listing the doc does not count, and
 neither does working from the recall subagent's summary alone; only the opt-in
-judge (`TEAMAI_UPVOTE_JUDGE=1`) credits that. `teamai stats` shows each recent
+judge (`TEAMAI_UPVOTE_JUDGE=1`) credits that. For Codex, Muse and ZCode it uses the Stop payload's final reply and this session's settled recall log; a Claude transcript is not required. `teamai stats` shows each recent
 session's runs, recalled docs and adopted docs. Per agent:
 
 - **Claude Code, Codex (0.134+), CodeBuddy (2.103.1+), WorkBuddy, Qoder,
@@ -436,3 +441,15 @@ limit for 429, or retry a temporary server failure. The error page is not a diff
 ## Session archive publication is busy or failed
 
 Session archive writers (`session push`, `migrate --push`, and `session pull`) wait up to ten seconds for another publication on the same machine. If busy, retry once it finishes. A failed save removes the new pair or restores the previous pair; a rollback failure names the retained backups. Remote push failures still keep the local commit.
+
+## OpenCode hooks cannot start the CLI
+
+If OpenCode hooks stopped after moving or reinstalling Node or TeamAI, run `teamai hooks inject` or `teamai pull` and restart OpenCode. The plugin records the installed Node and CLI paths so it also works without `teamai` on the service PATH. Doctor accepts those live paths when another installation of the same build inspects the plugin; missing saved paths or a changed handler still fail the check.
+
+## ZCode registered hooks but missing project rules
+
+Doctor checks the serialized rules reply against the user config `hooks.maxOutputBytes` (default 32768), counting UTF-8 bytes and JSON escaping. Other session hints make the complete stdout larger. Shorten the rules or raise the positive integer byte cap enough for the whole reply, then start a new session; registration alone does not prove the rules fit.
+
+## Pi user instructions with an override file
+
+Pi reads `AGENTS.override.md` before `AGENTS.md` in the same directory. In user scope, pull writes rules and instruction blocks into the existing override and strips only TeamAI blocks from the older configured file. Personal text in both files is preserved, including on uninstall. Without an override, the configured user file remains the target.

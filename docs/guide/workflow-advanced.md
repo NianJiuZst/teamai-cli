@@ -35,8 +35,8 @@ Each call to `next` does this, in order:
 
 1. It settles the run. If the run has ended, it answers `done`.
 2. It hands back an open lease of this driver that `running` leaves out. A restarted driver sends `"running":[]` and gets its open leases back, one per call.
-3. It leases the first ready step in file order. The steps of a sub-workflow take the place of the step that runs it. A step that needs a workspace mode `driver.can.workspace` does not list, or a workspace another driver opened, is held back, and the next ready step is leased.
-4. When every ready step is leased, it answers `wait`, and `reason` names the first open lease. When every ready step is held back, `reason` names each one, separated by `; `.
+3. It leases the first ready step in file order. The steps of a sub-workflow take the place of the step that runs it. A step that needs a workspace mode `driver.can.workspace` does not list, something else `driver.can` does not declare (see [Requirements and limits](#requirements-and-limits)), or a workspace another driver opened, is held back, and the next ready step is leased.
+4. When every ready step is leased, it answers `wait`, and `reason` names the first open lease. When every ready step is held back, `reason` names each one, separated by `; `, and `held` lists them as `{ step, reason, missing }`. `missing` names what the driver lacks, such as `hitl` or `workspace.new`, and is empty when another driver holds the workspace.
 
 A driver that sends no `running` gets its open lease back on every call, so it runs one step at a time.
 
@@ -70,7 +70,7 @@ With `max_parallel` above 1:
 - Each command runs without a terminal, so it cannot read input from you.
 - On Ctrl-C, or on a SIGTERM, SIGQUIT, or SIGHUP, teamai stops every command, waits for them to exit, and exits with that signal.
 
-With 1, the driver runs one step at a time, and a command runs in your terminal, where Ctrl-C reaches it.
+With 1, the driver runs one step at a time, and a command runs in your terminal, where Ctrl-C reaches it. A SIGTERM or SIGHUP sent to teamai alone stops the command, waits for it, and exits with that signal.
 
 When an end cancels a running command, the driver sends SIGTERM to it and the processes it started, then SIGKILL 5 seconds later if any still run. A stopping command keeps its slot until its processes exit.
 
@@ -578,6 +578,79 @@ steps:
 Pass the whole list, as `explain` does in `fan-build`, when the prompt needs every entry.
 
 
+## Requirements and limits
+
+A step says what it needs in `requires`. `defaults.requires` in a workflow file applies to each step in it. A step's own keys replace those, and `env` lists add up. The workflow file can also set `setup`, `timeout`, and `budget`, and a prompt step can set `max_turns`.
+
+```yaml
+schemaVersion: v1alpha1
+name: release
+description: Build the package, then review it.
+timeout: 1h
+budget: { tokens: 200000 }
+setup:
+  command: npm ci
+  requires: { env: [NPM_TOKEN] }
+defaults:
+  requires: { network: false }
+steps:
+  - id: build
+    workspace: new
+    timeout: 10m
+    requires: { env: [SIGNING_KEY] }
+    command: npm run build
+  - id: review
+    needs: [build]
+    prompt: Review the build.
+    max_turns: 5
+```
+
+| Key | What it does | A driver that cannot do it |
+|---|---|---|
+| `requires.env` | Gives the step these [team env](sharing.md#env-environment-variables) keys. Every other team env key, and every key another step of the run requires, is kept from it. Only key names enter the run. A key with no value on this machine fails the step `missing_env` before it runs, with the `teamai env set` command to run. A step `env:` entry that names a team secret or a required key fails `env_conflict`. | The step waits. |
+| `requires.network` | `false` asks that the step get no network. | The step runs, and its `unenforced` lists `network`. The local driver cannot deny the network. |
+| `requires.isolation` | `none`, `worktree`, or `sandbox`. A step with a workspace has at least `worktree`. | The step runs, and its `unenforced` lists `isolation`. |
+| `setup` | The driver runs `command` in each workspace it creates, before the step. Setup gets its `requires.env` keys; a step gets them only if it requires them too. Setup fails the step without running it, and the workspace is removed, when it exits non-zero (`setup_failed`), changes a file git would commit (`setup_dirty`), or leaves the value of one of its keys in a file it wrote, ignored files included (`setup_secret`). The step's `timeout` bounds setup. | Steps with a workspace wait. |
+| `timeout` | `500ms`, `30s`, `10m`, or `2h`, on a step or the workflow file. A step past it is stopped and ends with outcome `timeout`. On a workflow step, it stops every step inside. On the workflow file, the run ends `failed` with `timeout`. A retry starts the timeout again. | Not a capability. Every driver gets `expiresAt` on the lease. |
+| `budget` | `{ tokens: N }` on the workflow file or a workflow step. Input and output tokens of every step under it count from when it starts: the run's from its start, a workflow step's from each time it starts, such as a loop's next pass. A retry starts the budget again. Once they pass `N`, its open steps stop and it fails `budget_exceeded`. | A headless prompt under a budget waits. Its success report without tokens fails `budget_unmeasured`. An interactive prompt runs, since a person drives it; when its report has no tokens, its `unenforced` lists `budget`. |
+| `max_turns` | Caps the agent turns of a prompt step. The local driver passes it to headless Claude only. | The step runs, and its `unenforced` lists `max_turns`. |
+
+`unenforced` is on the lease, the step, and the run record. Each `interactive: true` step also needs a driver with HITL, as [HITL](#hitl-human-in-the-loop) describes.
+
+A member can set what any driver may use on their machine, beside `max_parallel` in local config:
+
+```yaml
+workflows:
+  max_parallel: 4
+  sandbox: true
+  allow:
+    network: false
+    env: [NPM_TOKEN]
+```
+
+- `allow.network: false` holds each step that requires `network: true`. `allow.env` holds each step whose `requires.env`, or whose setup's, names a key it does not list. `wait.held[].missing` names `policy.network` or `policy.env`.
+- `sandbox: true` says this host contains what it runs, such as a CI VM or a container, so the local driver declares `sandbox` isolation.
+- `max_parallel` also caps how many leases of one run every driver on this machine holds at once.
+
+`allow.network` filters declared step requests. Setup declares only environment keys in v1 and receives no network restriction from that setting. To guarantee that setup and steps cannot reach the network, use a driver and host that enforce it for every process.
+
+The value of each key declared in `env/secrets.yaml`, including one this machine takes from the environment as a CI job does, and of each environment variable whose name looks like a secret, is masked as `<REDACTED:KEY>` in the run file, the run records, every `teamai workflow` output, and the `result.json` the local driver keeps for each attempt. `start` refuses inputs that hold one with `invalid_inputs`, naming the key and never the value. To mask a value whose name does not look secret, such as `DATABASE_URL`, declare its key in `env/secrets.yaml`.
+
+A driver other than `local` declares what it can do in `driver.can` on each `next`:
+
+| `driver.can` key | The driver |
+|---|---|
+| `hitl` | Lets a person answer HITL requests and work in interactive steps. |
+| `workspace` | Takes leases in these workspace modes: `read-only`, `new`, `continue`. |
+| `env` | `true`: resolves `lease.envScope.provide` itself, removes `lease.envScope.withhold`, and keeps the values from what runs the step. `"commands"`: does that for command steps and setup only, so a prompt step with `requires.env` waits. A driver whose agent runs the step leaves it out, or sends `"commands"` when it starts the commands itself. teamai before 0.28.0 answers `"commands"` with `invalid_json`. |
+| `setup` | Runs `lease.setup.command`, with `lease.setup.envScope`, in each workspace it creates and in one whose setup never finished, and fails the step with the codes above. Every lease with a workspace carries `setup` when the workflow declares it. |
+| `tokens` | Reports the tokens of every successful headless prompt step. |
+| `max_turns` | Passes `lease.maxTurns` to the tools it can cap, and reports `"unenforced":["max_turns"]` for the others. |
+| `network` | Can deny a step the network. |
+| `isolation` | Keeps every step at this level: `none`, `worktree`, or `sandbox`. |
+
+An omitted key means the driver cannot. `next` lists any other key in `ignored`. The skill driver of a [coding session](workflow.md#run-from-a-coding-session) declares `hitl`, every `workspace` mode, `env: "commands"`, and `setup`. It never declares `tokens`, `max_turns`, or `network`, and its `isolation` is `none`.
+
 ## HITL (human in the loop)
 
 HITL covers `approve`, `choose`, and `interactive` steps where a person takes part.
@@ -608,7 +681,7 @@ steps:
 
 Later steps read `steps.decide.choice` and `steps.decide.note`, also through `passes[n]`. A new pass asks again. An approve HITL request on an end-only step must receive `yes` before that end is reached.
 
-For an approval that must come directly from a person, use `approve: { message: Publish?, required: true }`. Required approvals never use automatic answers. `respond` records the answer time, channel, choice, and optional note. With `--json`, its channel is `driver`, with `agent: false`. Without `--json`, TTY stdin records `tty`, with `agent: false`; otherwise it records `cli`, with `agent: true`. A required approval rejects `cli` answers with `agent_in_path`. A TTY is a channel convention, not protection against someone who can create a PTY. An answer from the [dashboard](dashboard.md#workflow-runs) records channel `dashboard`, with `agent: false`.
+For an approval that must come directly from a person, use `approve: { message: Publish?, required: true }`. Required approvals never use automatic answers. `respond` records the answer time, channel, choice, and optional note. With `--json`, its channel is `driver`. Without `--json`, TTY stdin records `tty`; otherwise it records `cli`. An answer is recorded `agent: true` when it records `cli`, or when the process that sent it runs inside an agent session (an agent's session variable such as `CLAUDE_CODE_SESSION_ID` is set); otherwise `agent: false`. Inside a workflow attempt (`TEAMAI_WORKFLOW_ATTEMPT` is set), `respond` records nothing and answers `nested_workflow`. A required approval rejects `agent: true` answers with `agent_in_path`, which names the command for the person to run in their own terminal. A TTY and these variables are evidence, not protection against someone who can create a PTY or unset a variable. An answer from the [dashboard](dashboard.md#workflow-runs) records channel `dashboard`, with `agent: false` unless `teamai dashboard` runs inside an agent session.
 
 ```sh
 teamai workflow respond <run> decide build --note "Ready" --pass 1
@@ -617,9 +690,9 @@ teamai workflow resume <run>
 
 `--pass` rejects an answer for a HITL request replaced by a later pass. A second answer in the same pass is `repeated_response`.
 
-Drivers other than `local` use the same HITL contract. Send `driver.can.hitl` on every `next` request, including busy polls. Set it to `true` when a person can answer HITL requests and work in interactive steps. When no lease is ready, `next` returns `hitl` with `run`, `step`, `pass`, `kind`, rendered `message`, `options`, optional `default`, and `required`, plus a `respond` command template. Show `hitl.message` and `hitl.respond` to that person, who runs `teamai workflow respond` with `<option>` replaced by a choice. The template quotes fan-out step paths such as `'items[0].ask'`; keep those quotes. The `cli` channel can answer optional HITL requests only. A driver with its own UI can submit a person's answer, including a required approval, with `respond --json '{"driver":{"kind":"ide","machine":"host","workspace":"/work"}}'`; this records channel `driver`, `agent: false`, and the driver identity locally. The driver declares that a person answered in its UI and must never send an answer its agent chose; like the TTY convention, this is a declaration, not protection.
+Drivers other than `local` use the same HITL contract. Send `driver.can.hitl` on every `next` request, including busy polls. Set it to `true` when a person can answer HITL requests and work in interactive steps. When no lease is ready, `next` returns `hitl` with `run`, `step`, `pass`, `kind`, rendered `message`, `options`, optional `default`, and `required`, plus a `respond` command template. Show `hitl.message` and `hitl.respond` to that person, who runs `teamai workflow respond` with `<option>` replaced by a choice. The template quotes fan-out step paths such as `'items[0].ask'`; keep those quotes. The `cli` channel can answer optional HITL requests only. A driver with its own UI can submit a person's answer, including a required approval, with `respond --json '{"driver":{"kind":"ide","machine":"host","workspace":"/work"}}'`; this records channel `driver`, `agent: false`, and the driver identity locally. Sent from inside an agent session, it records `agent: true`, so a required approval refuses it. The driver declares that a person answered in its UI and must never send an answer its agent chose; like the TTY convention, this is a declaration, not protection.
 
-A ready lease wins over a HITL request. While a tool runs, poll `next` with its attempt id in `running` and `canTakeLease: false`, show any HITL request, and stop tools whose attempt ids appear in `cancelled`. Only a driver with HITL may take `interactive` leases; a driver without HITL fails them with `hitl_required`.
+A ready lease wins over a HITL request. While a tool runs, poll `next` with its attempt id in `running` and `canTakeLease: false`, show any HITL request, and stop tools whose attempt ids appear in `cancelled`. Only a driver with HITL may take `interactive` leases; an interactive step waits for one.
 
 Without that capability, a `next` request that can take a lease applies this table. Busy polls leave waiting HITL requests unanswered and return `wait` when the driver has no HITL capability.
 
@@ -630,9 +703,9 @@ Without that capability, a `next` request that can take a lease applies this tab
 | Choose with default | Take default, channel `auto_approve` | Fail `hitl_required` |
 | Choose without default | Fail `hitl_required` | Fail `hitl_required` |
 
-Every decision without HITL and `hitl_required` failure logs a warning to stderr. Set `workflows.auto_approve` beside `workflows.max_parallel` in local config, or pass `--auto-approve` to `start --driver local` or `resume` for that process only. JSON `next` cannot set this override. The local driver declares HITL only when stdin and stderr are TTYs. It asks on stderr, accepts a choice followed by an optional note, and keeps polling while the question is open. An answer from elsewhere or a cancellation closes that question. Questions wait while an interactive tool owns the terminal.
+Every decision without HITL and `hitl_required` failure logs a warning to stderr. Set `workflows.auto_approve` beside `workflows.max_parallel` in local config, or pass `--auto-approve` to `start --driver local` or `resume` for that process only. JSON `next` from a driver without HITL cannot set this override. A driver with HITL ignores `workflows.auto_approve`: it sends `autoApprove: true` on `next` when the person chose auto-approve for the run, and the local driver in a terminal does so with `--auto-approve`. Optional approvals and choices with a default are then answered as in the `auto_approve: true` column; required approvals and choices without a default still come back as `hitl`. The local driver declares HITL only in an attended run (see [Attended and unattended runs](workflow.md#attended-and-unattended-runs)) whose stdin and stderr are TTYs. It asks on stderr, accepts a choice followed by an optional note, and keeps polling while the question is open. An answer from elsewhere or a cancellation closes that question. Questions wait while an interactive tool owns the terminal.
 
-`interactive: true` needs `prompt` or `prompt_file`. A driver without HITL fails it with `hitl_required`. The local driver opens the tool here in the workspace with inherited stdio and the prompt as its first message. Repository edits by the person are kept, and the step succeeds. An interactive step that sets `workspace: read-only` is checked like a command: a checkout change fails `read_only_dirty` and the edits stay. Inside a workspace an enclosing step opened, they are kept on `refs/teamai/kept/<attempt>` and removed from the workspace. An interactive step in its own workspace can still change that workspace. Headless prompts remain read-only. Terminal Ctrl-C and Ctrl-\ go to the interactive tool; SIGTERM and SIGHUP stop it and the driver. A result file is optional when the interactive tool exits successfully without outputs. The driver polls every two seconds during prompts and stops a cancelled tool.
+`interactive: true` needs `prompt` or `prompt_file`. The step waits for a driver with HITL. Without a terminal, `--driver local` stops with `busy` and a reason that names `hitl`; run `resume` from a terminal. The local driver opens the tool here in the workspace with inherited stdio and the prompt as its first message. Repository edits by the person are kept, and the step succeeds. An interactive step that sets `workspace: read-only` is checked like a command: a checkout change fails `read_only_dirty` and the edits stay. Inside a workspace an enclosing step opened, they are kept on `refs/teamai/kept/<attempt>` and removed from the workspace. An interactive step in its own workspace can still change that workspace. Headless prompts remain read-only. Terminal Ctrl-C and Ctrl-\ go to the interactive tool; SIGTERM and SIGHUP stop it and the driver. A result file is optional when the interactive tool exits successfully without outputs. The driver polls every two seconds during prompts and stops a cancelled tool.
 
 ## Retry, cancel, and resume
 
@@ -642,10 +715,129 @@ teamai workflow cancel <run> [step]
 teamai workflow resume <run> --tools default=claude
 ```
 
-`retry` accepts a leased, failed, or cancelled step, a refused approve with an answer, or an answered choose. Retry a HITL request to change its answer; its old answer stays in pass history. It frees an old lease and starts a new pass at a new revision. The local driver stops a command it was running and starts the new pass only after that command has exited. It resets the steps that depend on or read that step, including loop waits and item `after` dependencies. A HITL request among them that waits, or was answered and has not run, is asked again at a new pass. It reopens settled enclosing workflows, items, fan-out steps, and the run. If the reopened run is still running, the result includes a `resume` command. Run it to continue locally, or let your driver poll `next`. Unanswered skips in each affected container are re-derived; manual cancellations outside it stay cancelled. An independent standing end or break prevents retry.
+`retry` accepts a leased, failed, or cancelled step, a refused approve with an answer, or an answered choose. Retry a HITL request to change its answer; its old answer stays in pass history. It frees an old lease and starts a new pass at a new revision. The local driver stops a command it was running and starts the new pass only after that command has exited. It resets the steps that depend on or read that step, including loop waits and item `after` dependencies. A HITL request among them that waits, or was answered and has not run, is asked again at a new pass. It reopens settled enclosing workflows, items, fan-out steps, and the run. A step whose pull request delivery failed keeps its pass, and only its delivery runs again. If the reopened run is still running, the result includes a `resume` command. Run it to continue locally, or let your driver poll `next`. Unanswered skips in each affected container are re-derived; manual cancellations outside it stay cancelled. An independent standing end or break prevents retry.
 
 History stays in `passes` and the archive, so `length(steps.x.passes)` counts failed attempts too. Retrying a loop owner resets its iteration count. Retrying another step in its range keeps the owner's count. Retry keeps the top-level workflow's round count, so retry in its exhausted final round can fail `loop_exhausted` again.
 
-A single-step `cancel` stops pending, waiting, leased, or running work. Its open descendants stop too. Cancelled steps count as stopped, so dependents skip unless an `if` reads their outcome for recovery. The run normally fails. A whole-run cancel ends immediately with run outcome `cancelled`, without starting another loop round. Cancel does not bump the revision. A late report returns `lease_cancelled`; `next.cancelled` tells drivers which tools to stop.
+A single-step `cancel` stops pending, waiting, leased, running, or delivering work. Its open descendants stop too. Cancelled steps count as stopped, so dependents skip unless an `if` reads their outcome for recovery. The run normally fails. A whole-run cancel ends immediately with run outcome `cancelled`, without starting another loop round. Cancel does not bump the revision. A late report returns `lease_cancelled`; `next.cancelled` tells drivers which tools to stop.
 
-`resume` drives the run locally after a retry, response, Ctrl-C, or closed terminal. It uses this machine's open local lease workspace first, then the workspace of the latest driver that called `next` when that driver was local on this machine, then the current directory. Resuming after a retry from a subdirectory therefore keeps the original local workspace. Only one local driver can drive a run at a time. A second resume returns `driver_running` with the owning process id; stop that driver or wait. Locks from dead processes are reclaimed automatically. A settled run returns `done`. Failed and cancelled local runs exit 1; successful control commands exit 0 even when their answer describes a failed or cancelled run.
+`resume` drives the run locally after a retry, response, Ctrl-C, or closed terminal. `workflow start --driver local` prints the run id on stderr when the run starts, with the `resume` command that continues it. It uses this machine's open local lease workspace first, then the workspace of the latest driver that called `next` when that driver was local on this machine, then the current directory. Resuming after a retry from a subdirectory therefore keeps the original local workspace. Only one local driver can drive a run at a time. A second resume returns `driver_running` with the owning process id; stop that driver or wait. Locks from dead processes are reclaimed automatically. A settled run returns `done`. Failed and cancelled local runs exit 1; successful control commands exit 0 even when their answer describes a failed or cancelled run.
+
+## Publish and claim
+
+```sh
+teamai workflow publish <run> [--sessions]
+teamai workflow resume <run> [--claim]
+```
+
+[Continue a run on another machine](workflow.md#continue-a-run-on-another-machine) shows the common case. This section covers the rules.
+
+The first `publish` makes this install the run's owner. The owner is an install id, kept in `workflows/owner.json` under the TeamAI data directory, plus the member's TeamAI username, the one the run records carry. Two installs of one member show the same user name, and the id tells them apart. `publish` prints one envelope:
+
+```json
+{"data":{"run":"<run>","publication":"published","stateRevision":1,"inFlight":[{"step":"fix","attempt":"<attempt>","driverKind":"local"}]}}
+```
+
+`inFlight` lists the leases still open. A claim releases them, so those steps run again. Publishing a run that has not changed since its last publish answers `"publication":"unchanged"` with the same `stateRevision`, and writes nothing. Each publish that changes the run adds the whole state to the history of `teamai-reports`, so publish when you hand a run over, not after every step. Only the owner can publish the run. On another install, `publish` answers `not_owner` and changes nothing.
+
+When a published run ends, through `next` or through `workflow respond`, `retry`, or `cancel`, teamai publishes how it ended, as `workflow publish` does. When that is refused, the `done` envelope of `next`, or the `data` of the command, carries `notPublished`, a refusal from the table below. `not_owner` means another install claimed the run, so its state and its run record stay as that install has them. For any other refusal, take its next step. The next `next` or `workflow resume` of the run also publishes the end again.
+
+`resume` decides from what this machine has:
+
+- A run this machine has and never published continues locally. `resume` does not read `teamai-reports`.
+- A run whose first publish never reached `teamai-reports` continues locally too. `resume` reads `teamai-reports` to check, and answers `reports_unreachable` when it cannot.
+- A run this machine does not have is claimed from `teamai-reports`, then driven.
+- A published run continues only while this install owns it. Otherwise `resume` answers `not_owner` with `owner` (`id`, `user`) and `ownedAt`.
+- A claim of a run that ended runs none of its steps again. The claiming install owns the run, so `workflow retry` there runs again only the step it names and the steps that depend on it.
+- `--claim` takes a published run over from its owner. It replaces this machine's copy of the run. While a local driver of the run is running on this machine, it answers `driver_running` and claims nothing.
+
+Run `resume` in a checkout of the run's business repository. A claim of a run that is still running checks with `git ls-remote` that the run's branches are on that checkout's `origin` at the commits the run recorded. It never fetches into the checkout. A run that has ended needs none of its branches, so a claim takes it even after a merge deleted them, and `resume` reports how it ended. If a retry reopens it, the next `resume` fetches the branches it needs. When this machine's workflow cache differs from the workflows the run ran, the claim reads them at the run's team commit, fetching that commit when the team repo lacks it, and prints `[team commit <commit>] Synced N workflows` on stderr. Your cache and your team repo checkout stay as they are.
+
+The published state is `workflows/runs/<run>/state.json` on `teamai-reports`. It carries what the run needs to continue: status, inputs, each step's outcome, outputs, passes and HITL answers with their notes, the base, the commit of each workspace, and the tool and id of each session copy a step continued. The workflows themselves travel only as `sourceHash`, `definitionHash`, and `teamRevision`. It leaves out step and pass `message`, the driver identity of each lease and answer (a lease keeps its driver kind), workspace owners, and the business checkout path. Every failure message becomes `The details stay on the machine that ran this step.`, and the failure `code` stays. A commit appears only as a full id (40 or 64 hex digits). `publish` checks every value and key against TeamAI's secret patterns, this process's environment secrets, and the value of each secret the team declares in [`env/secrets.yaml`](sharing.md#env-environment-variables), whatever its name, and refuses the first match with `secret_detected`. A declared value shorter than 8 characters matches only as a whole word, and one shorter than 4 is not checked: `publish` warns and names it. The refusal names the step, the field, and the kind of secret, never the value. It refuses an absolute path of this machine the same way, with `local_path_detected`: a Windows drive or share path, a `~/` path, a `file://` URL, or a `/` path whose first directory exists at this machine's root, such as `/Users/alice/data.csv`. A URL, a relative path such as `src/main.ts`, and a route such as `/api/v1` pass. Such a run cannot be handed over. Continue it on this machine, or start it again with paths relative to the repository.
+
+`--sessions` also puts the latest copy of each agent session the unsettled steps will continue (`session: continue` or `session.from`) in the team session archive, scrubbed as `teamai session push --scrub` scrubs them. That includes a step a loop is about to run again and the steps of a workflow step that has not started. It never includes a settled step's session or an earlier pass's. The envelope then lists them in `sessions` as `{"tool","id"}`, an empty list when there are none. A session this machine cannot read is left out: its chain archives the newest one it can read, and `skipped` lists the newer ones it left out. A chain with none readable refuses the publish. The sessions are archived before the state is written, so a publish refused after that leaves them archived, and an unchanged publish still archives them. On the machine that continues the run, the local driver resumes a step's session in this order:
+
+1. The session on this machine. The step's tool resumes it by id when it is the session's tool, and gets a copy of it otherwise.
+2. A copy of the archived session. The copy is written once, and a later restore reuses it with the turns added to it. The driver reads the archive as the team repo's origin has it, fetched once per driver run, so you do not run `teamai pull` first, and your team repo clone stays as it is. When that fetch fails, it reads your clone and says it may be older than origin.
+3. When the session is a copy another step made, and neither of those has it, the same two ways for the session that copy continued, and so on back to the first. The step then misses the turns of the copies it could not get.
+4. A new session, with a warning on stderr that starts `⚠ Step "<id>" starts a new <tool> session:` and says why each of those failed.
+
+The step's tool needs its session store on that machine, such as `~/.claude/projects` for Claude Code, as `teamai session restore` does. OpenCode gets the archived session, but its step still starts a new session, because OpenCode has no flag to resume one.
+
+A lease's `session` lists in `earlier` the sessions it continued, newest first, for a driver that cannot get the session itself. A driver other than `local` that continued the lease's `session`, or one in `earlier`, by its id or in a copy, puts the one it continued in its report as `resumed` (`{"tool","id"}`), next to the `session` it ran. It leaves `resumed` out when it started a new session. Without `resumed`, later steps resume the lease's session, not the copy. A `resumed` without a tool and an id, on a step that resumes no session, or naming a session the lease did not offer (neither its `session` nor one in `earlier`), answers `invalid_report`.
+
+Every refusal is one JSON envelope with `error.code`, `error.message`, and the extra fields listed below. The command exits 1.
+
+| Code | What happened | Next step |
+|---|---|---|
+| `not_owner` | Another install owns the run. Carries `owner` and `ownedAt`. | Ask the owner, or take it over with `resume <run> --claim`. |
+| `state_moved` | The run changed while this machine prepared its claim or its publish: on `teamai-reports` for a claim, on this machine for a publish. Nothing was claimed or published. | Claim again, or publish again. |
+| `state_conflict` | `teamai-reports` holds a later state than this machine last saw. | Run `resume <run>` to take the published state. |
+| `run_not_published` | Nobody published the run. | Publish it from the machine that has it. |
+| `run_not_found` | This machine has no run with that id. | Check the id. |
+| `run_unreadable` | The run file on this machine cannot be read. | Check the run file in the TeamAI data directory. |
+| `run_mismatch` | A run here has the same id but started at another time. Carries `localCreatedAt` and `remoteCreatedAt`. | Neither run is changed. They are different runs. |
+| `invalid_run` | The id is not `r` followed by 8 or 16 hex digits. | Check the id. |
+| `unsupported_repo` | The team repo is an `http` repo, which has no `teamai-reports`. | Continue the run on the machine that has it. |
+| `busy` | Another teamai process is writing `teamai-reports` or the run, or another open attempt holds the place `next --prepare` would prepare. | Try again; for a held place, once that attempt reports. |
+| `reports_unreachable` | `teamai-reports` could not be read from the team repo's origin. | Check the connection, then try again. |
+| `reports_failed` | The write to `teamai-reports` failed. | Try again. |
+| `records_pending` | The run's records did not reach `teamai-reports`: git's push error, a busy writer, or a record queued while the publish ran. | Try again. |
+| `definition_mismatch` | The claim cannot get the workflows the run ran. May carry `teamRevision`. | Follow the message: run `teamai pull` after the other machine pushed its workflows, fetch the team commit, or use the same teamai version on both machines. |
+| `snapshot_unsupported` | The state has a field, named in `field`, that the snapshot format cannot carry or this teamai cannot read. | On a claim, update teamai, then try again. On a publish, fix the driver that wrote the value, such as a commit that is not a full id. |
+| `secret_detected` | A value looks like a secret. Carries `step` (when in a step), `field`, and `label`. | Continue the run on this machine. |
+| `local_path_detected` | A value holds an absolute path of this machine. Carries `step` (when in a step) and `field`. | Continue the run on this machine, or start it again with paths relative to the repository. |
+| `sessions_not_archived` | No session of a chain the steps continue can be read here (or its tool is not one teamai reads), the archive was busy, or the commit or push failed. | Publish again, or publish without `--sessions` so those steps start new sessions. |
+| `origin_unavailable` | The business repository's origin could not be read or updated. | Run the command in the run's business checkout, with access to its origin. |
+| `commit_missing` | A recorded branch is not on origin, is behind the recorded commit on a publish, or the base cannot be pinned because this checkout lacks it. Carries `branch` and `commit`. | Push the branch from the machine that has the commit. On a publish, the message gives the `git -C <checkout> push origin <commit>:refs/heads/<branch>` to run. Or publish from the checkout the run started in. |
+| `branch_diverged` | A branch on origin holds work the run does not know about. Carries `branch`, `expected`, and `actual`. | On a publish, have the driver that pushed it report it, or move the branch on origin back to the recorded commit. On a claim, the member the message names can publish the run again; moving the branch back discards the commits past the recorded one. |
+
+After a claim, `resume` can also answer `branch_diverged` when a local branch cannot be brought to the commit the run recorded. The message names the workspace and what to do. See [Workspaces in your own driver](#workspaces-in-your-own-driver).
+
+### Publish from CI
+
+A CI job that runs a workflow with `--driver local` can publish the run when it fails, so a member resumes it on their own machine. The job publishes from the checkout the run started in. `publish` pushes the run's base to the business repository's origin once, as `teamai/<run>/base`, without force, and reads the run's branches there with `git ls-remote`. The job's token therefore needs push access to the business repository, which on GitHub Actions is `permissions: contents: write`. A workflow that runs for a pull request from a fork gets a read-only token and cannot publish. The job also needs write access to the team repo, where `teamai-reports` lives.
+
+### Claim from your own driver
+
+A driver other than `local` claims a run by adding `"claim": true` to its first `next` payload:
+
+```text
+teamai workflow next <run> --json '{"claim":true,"driver":{"kind":"script","machine":"runner","workspace":"/work"}}'
+```
+
+The claim runs before `next` leases anything, and checks a running run's branches on the origin of `driver.workspace`. It then brings each local branch to the commit the run recorded, as `resume` does, and answers `branch_diverged` when it cannot. A run this install already owns stays as it is. A claim refusal comes back as the `next` error envelope. From an agent session, the claim follows the run's `invoke` as `resume` does: a payload cannot carry the person's yes, so an `ask` run answers `confirm_needed`, and once the person agrees the session continues it with `teamai workflow resume <run> --claim --confirmed`. On `state_moved`, send the claim again. A value other than a boolean answers `invalid_json` with `claim must be a boolean`. A driver whose runs another machine may continue reports full commit ids in `changes` and `read`. `publish` refuses a run with any other commit value as `snapshot_unsupported`, naming the field.
+
+## Workspaces in your own driver
+
+A driver other than `local` that takes workspace leases keeps the run's commits where another driver or another machine can find them. Every driver follows two rules:
+
+1. Before it starts a step from `workspace.start`, merges an entry of `workspace.merge`, or restores agent files from `workspace.configCommit`, it checks that its checkout has the commit, with `git cat-file -e <commit>^{commit}`. When one is missing, it fetches the run's branches with the refspec `+refs/heads/teamai/<run>/*:refs/remotes/origin/teamai/<run>/*` and checks again. A fetch whose refspec matches no branch still succeeds, so only the second check decides. A commit that is still missing fails the step with `workspace_base` before anything runs, and the message names the commit and its branch.
+2. When the checkout has an `origin`, it pushes the branch of the commits it reports in `changes` before it sends the report, also when the step failed. When that push fails, it still reports the commits. A step that succeeded then fails with `push_failed`. A step that failed keeps its own failure, and its message adds that the branch was not pushed.
+
+`workflowGitConformanceScenarios` in `src/workflow/conformance/git.ts` checks both rules against a bare `origin`. Run them against your driver, as `src/__tests__/workflow-git-conformance.test.ts` runs them against `local`.
+
+A driver that continues a [published run](#publish-and-claim) relies on these rules too:
+
+- `publish` pins the run's base on `origin` as `teamai/<run>/base`, so the fetch in rule 1 also brings in the base commit.
+- After a claim, before it continues a workspace it has locally, the driver moves that branch forward to the commit the run recorded. It refuses, and moves nothing, when the local branch is ahead of that commit or has diverged from it, when its worktree has changes or is on another branch, or when a read-only step left it and it is not back. The local driver does this once per claim, before its first lease, and answers `branch_diverged` with what to do.
+- A workspace the claim brought in has no owner until a driver leases a step in it. That driver becomes its owner.
+- A lease another machine held in a step that opened its own workspace starts again as that step's next pass, on a new branch. The old branch stays on `origin` with whatever was pushed to it. That step asks its HITL question again. A lease in any other step is released and runs again in the same pass.
+
+### Let TeamAI prepare the workspace
+
+A driver can leave the workspace and its git to TeamAI. `next <run> --prepare --json '<payload>'` leases a step and prepares its workspace: it creates or reuses the worktree in the checkout the run started from, applies the base agent files and team delivery, and returns the directory as `lease.cwd`. Preparing again keeps the edits already there. Run the step in `lease.cwd`, and run no git there. Two attempts never share a place, and the checkout is one place, so steps that work in the checkout run one after another, even parallel ones: a lease whose place another open attempt holds answers `busy` and stays leased; prepare it with `--attempt` once that attempt reports. TeamAI stores no run mode for such a driver and runs setup in the mode of the process that calls `next --prepare` (see [Attended and unattended runs](workflow.md#attended-and-unattended-runs)), so export `TEAMAI_MODE` in the driver to keep one mode across its calls.
+
+`report` then finishes the attempt. It commits, pushes, and fills `changes` or `read` itself, so a report of a prepared attempt that carries `changes` or `read` answers `invalid_report`. TeamAI removes the worktree only after it accepts a successful report whose answer allows cleanup. A failed attempt keeps its work for a retry.
+
+To prepare an attempt the driver already leased, run `next <run> --prepare --attempt <attempt>`. It answers `wrong_attempt` when the run no longer leases that attempt to the driver. With `--adopt <dir>`, the attempt runs in a place the host made: a clean worktree of this repository on the lease's workspace branch, or detached at its start, as `git worktree add` makes it. A place that does not fit answers `adopt_mismatch`, and the attempt stays leased. TeamAI commits and pushes there as in its own worktree, and never removes the place.
+
+What TeamAI records to prepare an attempt stays on this machine: paths and file fingerprints, with no prompt, env value, or graph.
+
+## Judge work in your own driver
+
+```text
+teamai score --next --json '{"driver":{"kind":"script","machine":"runner","workspace":"/work","can":{"judge":{"isolation":"best-effort","tools":["claude"]}}},"running":[]}'
+```
+
+Judge work comes from `teamai score --next`, never from `workflow next`. See [Scorers](scorers.md#any-driver).

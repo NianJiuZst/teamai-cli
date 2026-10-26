@@ -32,6 +32,7 @@ import { describeInvalidToolHomes, envToolHome, realHost, reloadToolHomes, toolH
 import { isToolId } from './tools.js';
 import { isCodexTool } from './utils/tool-names.js';
 import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder, keptTeamHookEntries, readCodexHookTrustForScope } from './hooks.js';
+import { codexBuildSkewMessage } from './codex-trust.js';
 import {
   buildDeliveryChecks,
   toolPathsDroppedKeyNotes,
@@ -456,19 +457,24 @@ function usageReportNote({ localConfig, teamConfig }: DoctorContext): string {
  * Whether the public Codex will run the hooks teamai wrote in this scope (#955),
  * asked read-only through `codex app-server` `hooks/list`. A check when Codex
  * answers; the trust reminder as a note when it cannot (no `codex` on PATH, the
- * app-server failed). Nothing when teamai wrote no Codex hook here.
+ * app-server failed). Nothing when teamai wrote no Codex hook here. A failing
+ * build check when the Codex builds teamai found disagree on version (#1244).
  */
 async function codexHookTrust(ctx: DoctorContext): Promise<{ checks: Check[]; notes: string[] }> {
   const report = ctx.teamConfig ? await readCodexHookTrustForScope(ctx.teamConfig, ctx.localConfig) : null;
   if (!report) return { checks: [], notes: [] };
+  const skew = report.skew;
+  const builds: Check[] = skew
+    ? [{ name: 'Codex builds agree', source: 'local', check: async () => false, fix: codexBuildSkewMessage(skew) }]
+    : [];
   if (report.kind !== 'listed') {
     const reason = report.kind === 'failed' ? ` (could not ask Codex: ${report.reason})` : '';
-    return { checks: [], notes: [`${codexTrustReminder()}${reason}`] };
+    return { checks: builds, notes: [`${codexTrustReminder()}${reason}`] };
   }
   const notLoaded = report.notTrusted.some((h) => h.status === 'not loaded');
   const notTrusted = report.notTrusted.map((h) => `${h.command} in ${h.file} (${h.status})`);
   return {
-    checks: [{
+    checks: [...builds, {
       name: 'Codex trusts the teamai hooks',
       source: 'local',
       check: async () => notTrusted.length === 0,
@@ -642,6 +648,16 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       },
       fix: 'Run `teamai pull` to publish them. If they stay queued, check that you '
         + 'can push to the team repo (run with --verbose to see the push error).',
+    },
+    {
+      // A score label waits on this machine until a push or a pull publishes it.
+      name: 'Score labels are published',
+      source: 'local',
+      check: async () => {
+        const { LabelStore } = await import('./scorers/label-store.js');
+        return await LabelStore.unpublished(localConfig) === 0;
+      },
+      fix: 'Run `teamai score --push` to publish them; it says why when it cannot.',
     },
     {
       // A dead process's lock cannot block anything — the next writer of that
@@ -869,6 +885,8 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   // how each alias agent's model resolved in each tool (#830).
   const { ruleChannelNotes } = await import('./resources/rules.js');
   const { dshSandboxNote } = await import('./dsh-hooks.js');
+  const { scorerNotes } = await import('./doctor-scorers.js');
+  const { shadowedWorkflowSkills } = await import('./workflow/discovery/workflow-skills.js');
   const notes = [
     ...await buildNamespaceNotes(ctx),
     ...await entryNamespaceNotes(ctx),
@@ -876,6 +894,10 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     ...ctx.teamConfig ? await keptTeamHookEntries(ctx.teamConfig, localConfig) : [],
     ...await aliasNamespaceNotes(ctx),
     ...await agentModelNotes(ctx),
+    // Invalid scorer files and scorers a workflow step lists without one, which a silent hook pull never shows.
+    ...await scorerNotes(localConfig),
+    // A team or member skill named workflow-<name> stands in for the skill pull generates (#1086).
+    ...ctx.teamConfig ? await shadowedWorkflowSkills({ teamConfig: ctx.teamConfig, localConfig }) : [],
     ...(await envAdvisories(localConfig, ctx.teamConfig, ctx.teamEnv)).map(describeEnvAdvisory),
     // A team MCP server a tool cannot use over its transport.
     ...await mcpTransportNotes(ctx),

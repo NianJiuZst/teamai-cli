@@ -129,12 +129,26 @@ vi.mock('../session-flow/migrate.js', () => ({
 
 vi.mock('../session-flow/sync.js', async (importOriginal) => {
   const actual = (await importOriginal()) as typeof import('../session-flow/sync.js');
+  class MockSyncManager extends actual.SyncManager {
+    private busy<T>(): import('../session-flow/sync.js').ArchiveWriteResult<T> | undefined {
+      return mocks.heldArchiveLock ? { status: 'busy', lockPath: mocks.heldArchiveLock } : undefined;
+    }
+    override saveSession(session: import('../session-flow/ir.js').Session, meta: import('../session-flow/sync.js').SessionSyncMeta) {
+      const busy = this.busy<string>();
+      return busy ? Promise.resolve(busy) : super.saveSession(session, meta);
+    }
+    override rebuildIndex(repoIdentity: string | null, dirOverride?: string) {
+      const busy = this.busy<number>();
+      return busy ? Promise.resolve(busy) : super.rebuildIndex(repoIdentity, dirOverride);
+    }
+    override rebuildAllIndexes() {
+      const busy = this.busy<{ repos: number; sessions: number }>();
+      return busy ? Promise.resolve(busy) : super.rebuildAllIndexes();
+    }
+  }
   return {
     ...actual,
-    withSessionIndexLock: (async (repo, fn) =>
-      mocks.heldArchiveLock
-        ? { status: 'busy', lockPath: mocks.heldArchiveLock }
-        : actual.withSessionIndexLock(repo, fn)) as typeof actual.withSessionIndexLock,
+    SyncManager: MockSyncManager,
   };
 });
 
@@ -1360,6 +1374,7 @@ describe('session resume of a session already restored', () => {
     const projects = path.join(mocks.home, '.claude', 'projects');
     const [transcript] = (fs.readdirSync(projects, { recursive: true }) as string[]).filter((f) => f.endsWith('.jsonl'));
     const restoredId = path.basename(transcript, '.jsonl');
+    expect(out.join('\n')).toContain(`To continue: claude --resume ${restoredId}`);
     fs.appendFileSync(path.join(projects, transcript), JSON.stringify({ type: 'user', message: { content: 'later turn' } }) + '\n');
     const before = fs.readFileSync(path.join(projects, transcript), 'utf-8');
     out = [];
@@ -1367,6 +1382,7 @@ describe('session resume of a session already restored', () => {
     await resume();
 
     expect(out.join('\n')).toContain(`Session already restored as ${restoredId}, nothing written.`);
+    expect(out.join('\n')).toContain(`To continue: claude --resume ${restoredId}`);
     expect(fs.readFileSync(path.join(projects, transcript), 'utf-8')).toBe(before);
     expect(process.exitCode).not.toBe(1);
   });

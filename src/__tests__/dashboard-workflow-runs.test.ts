@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { answerFromDashboard, listLocalRuns, listReportedRuns, workflowRunDetail } from '../dashboard/workflow-runs.js';
 import { HttpError } from '../dashboard/http.js';
 import { getReportsDir, type LocalConfig } from '../types.js';
@@ -10,6 +10,7 @@ import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import { leaseNext, startRun } from '../workflow/engine.js';
 import { readRun } from '../workflow/store.js';
 import type { RunState } from '../workflow/types.js';
+import { knownSecrets } from '../env-resolution.js';
 
 const roots: string[] = [];
 const driver = { kind: 'ide', machine: 'host-7f3a', workspace: '/private/work/checkout' };
@@ -31,10 +32,10 @@ async function waitingRun(hitl = 'approve: { message: "Ship {{ inputs.ticket }}?
     '  - id: ship', '    needs: [build]', `    ${hitl}`, '    prompt: Deliver {{ inputs.ticket }} as prompt-secret-text',
   ].join('\n'));
   expect((await syncWorkflowDefinitions(config)).invalid).toEqual([]);
-  const started = await startRun(config, 'ship', { ticket: 'TICKET-SECRET-42' });
+  const started = await startRun(config, 'ship', { ticket: 'TICKET-SECRET-42' }, { secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   const id = String(started.data.run);
-  const next = () => leaseNext(config, id, driver, { hitl: true });
+  const next = () => leaseNext(config, id, driver, { can: { hitl: true } });
   const lease = await next();
   if ('error' in lease) throw new Error(lease.error.message);
   const { attempt, revision } = lease.data.lease as { attempt: string; revision: number };
@@ -74,12 +75,26 @@ describe('dashboard workflow runs', () => {
   it('answers a required HITL request through the non-agent dashboard channel', async () => {
     const run = await waitingRun();
     expect(await answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'yes' }))
-      .toEqual({ answered: { step: 'ship', pass: 1, choice: 'yes', channel: 'dashboard' } });
+      .toEqual({ answered: { step: 'ship', pass: 1, choice: 'yes', channel: 'dashboard', agent: false } });
     expect((await run.state()).steps.find((step) => step.id === 'ship')?.answer).toMatchObject({ choice: 'yes', channel: 'dashboard', agent: false });
     const [row] = await listLocalRuns(run.config);
     expect(row?.waiting).toEqual([]);
     expect((await workflowRunDetail(run.config, 'local', run.id))?.steps.find((step) => step.step === 'ship'))
       .toEqual({ step: 'ship', pass: 1, status: 'pending', answer: { choice: 'yes', channel: 'dashboard' } });
+  });
+
+  it('refuses a required answer from a dashboard served inside an agent session, naming what the person runs', async () => {
+    const run = await waitingRun();
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'agent-1304');
+    try {
+      expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 1, choice: 'yes' }))).toEqual({
+        status: 400,
+        message: `Step "ship" needs an answer from the person, and the process that sent this one runs inside an agent session (CLAUDE_CODE_SESSION_ID is set). The person runs teamai workflow respond ${run.id} ship <yes|no> --pass 1 in their own terminal, or answers in a teamai dashboard started there.`,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect((await run.state()).steps.find((step) => step.id === 'ship')).toMatchObject({ status: 'waiting' });
   });
 
   it('refuses an answer to a pass the page no longer shows, and a repeated one', async () => {

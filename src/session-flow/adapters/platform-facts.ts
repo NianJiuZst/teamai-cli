@@ -124,5 +124,19 @@ export const SESSION_PLATFORM_FACTS = {
 } satisfies Record<string, SessionPlatformFacts>;
 
 export function sessionPlatformFacts(platform: string): SessionPlatformFacts | undefined {
-  return (SESSION_PLATFORM_FACTS as Record<string, SessionPlatformFacts>)[platform];
+  return Object.hasOwn(SESSION_PLATFORM_FACTS, platform)
+    ? SESSION_PLATFORM_FACTS[platform as keyof typeof SESSION_PLATFORM_FACTS]
+    : undefined;
+}
+
+/** How each CLI continues a session; the rest are assumed to take `<platform> --resume <id>`. */
+const RESUME_COMMANDS: Partial<Record<string, (sessionId: string) => string>> = {
+  'claude-code': (id) => `claude --resume ${id}`,
+  'codex': (id) => `codex resume ${id}`,
+  'opencode': (id) => `opencode --session ${id}`,
+};
+
+/** The command that continues a restored session in its platform's CLI. */
+export function resumeCommand(platform: string, sessionId: string): string {
+  return RESUME_COMMANDS[platform]?.(sessionId) ?? `${platform} --resume ${sessionId}`;
 }

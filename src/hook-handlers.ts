@@ -9,6 +9,7 @@
  * remain unchanged for backward compatibility during migration.
  */
 
+import os from 'node:os';
 import path from 'node:path';
 
 import type { ResolvedEntry } from './namespaced-entries.js';
@@ -145,7 +146,10 @@ const pullHandler: HookHandler = {
       log.debug(`hook-dispatch: seedProjectAgentRoot failed: ${(e as Error).message}`);
     }
     const { pull, settleLateUsageReport } = await import('./pull.js');
+    const { SessionCaptures } = await import('./session-flow/captures.js');
+    const before = config && await SessionCaptures.checkoutDelivery(config, tool);
     await pull({ silent: true });
+    if (config && before) await SessionCaptures.markTeamChanged(config, tool, stdin, before);
     await packageHints.stashPackageHintAfterPull(
       hintCwd,
       deriveSessionId(stdin, { includeCwd: true }),
@@ -155,6 +159,29 @@ const pullHandler: HookHandler = {
     // cut the push of a report pull() stopped waiting for. The host does not
     // wait for this pass, so waiting here does not delay the session.
     await settleLateUsageReport();
+    // Finished sessions are judged in a process this pass does not wait for, where a scope turns that on.
+    const { sessionScoringScopes } = await import('./score-sessions.js');
+    const scoringCwd = await pathExists(hintCwd) ? hintCwd : os.homedir();
+    const scoring = await sessionScoringScopes(scoringCwd).catch((e: unknown) => {
+      log.debug(`hook-dispatch: could not tell whether sessions are scored here: ${e instanceof Error ? e.message : String(e)}`);
+      return [];
+    });
+    if (scoring.length > 0) await spawnDetachedScoreSessions(scoringCwd);
+    return null;
+  },
+};
+
+/**
+ * Adds the tool's version to the capture the foreground pass wrote at session start (#1178), which never waits on it,
+ * and sweeps the captures of sessions that are gone.
+ */
+const sessionCaptureHandler: HookHandler = {
+  name: 'session-capture',
+  async execute(stdin, tool, config) {
+    if (!config) return null;
+    const { SessionCaptures } = await import('./session-flow/captures.js');
+    await SessionCaptures.addToolVersion(config, tool, stdin);
+    await SessionCaptures.sweep(config).catch((e: unknown) => log.debug(`session capture: could not sweep captures: ${e instanceof Error ? e.message : String(e)}`));
     return null;
   },
 };
@@ -263,6 +290,15 @@ async function spawnDetachedPull(cwd: string, event: GitHookEvent): Promise<void
   }).on('error', (e) => log.debug(`git hook: detached pull failed to start: ${e.message}`)).unref();
 }
 
+/** Start `teamai score-sessions` in `cwd`, which this process does not wait for. */
+async function spawnDetachedScoreSessions(cwd: string): Promise<void> {
+  const { resolveCliEntry } = await import('./builtin-hooks.js');
+  const { spawn } = await import('node:child_process');
+  spawn(process.execPath, [resolveCliEntry() ?? '', 'score-sessions'], {
+    cwd, detached: true, stdio: 'ignore', windowsHide: true,
+  }).on('error', (e) => log.debug(`hook-dispatch: detached score-sessions failed to start: ${e.message}`)).unref();
+}
+
 /**
  * The main checkout's `.teamai/`, where teamai creates its knowledge worktree.
  * Detection run from inside that worktree resolves the worktree as its own
@@ -339,7 +375,7 @@ const dashboardReportHandler: HookHandler = {
   async execute(stdin, tool, config) {
     // Registered with requiresConfig: a session outside any scope is not recorded.
     if (!config) return null;
-    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart } = await import('./dashboard-collector.js');
+    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart, gitStateIn } = await import('./dashboard-collector.js');
     const { getDataHome } = await import('./types.js');
     const raw = JSON.stringify(stdin);
     const event = await parseHookEvent(raw, tool, {
@@ -352,7 +388,7 @@ const dashboardReportHandler: HookHandler = {
       event.dataHomeKey = await dataHomeKey(getDataHome(config));
       const [projectAnchor] = await Promise.all([
         eventProjectAnchor(event.cwd, event.sessionId),
-        addGitStateAtStart(event),
+        addGitStateAtStart(event, gitStateIn(stdin)),
       ]);
       event.projectAnchor = projectAnchor;
       await appendEvent(event);
@@ -698,10 +734,12 @@ const votesJudgeHandler: HookHandler = {
     if (process.env.TEAMAI_UPVOTE_JUDGE !== '1') return null;
 
     const transcriptPath = typeof stdin.transcript_path === 'string' ? stdin.transcript_path : null;
-    if (!transcriptPath) return null;
+    const finalReply = typeof stdin.last_assistant_message === 'string' ? stdin.last_assistant_message.trim() : '';
+    if (!transcriptPath && !finalReply) return null;
 
     try {
       const sessionId = deriveSessionId(stdin, { includeCwd: true });
+      const dispatchSessionId = deriveDispatchSessionId(stdin, _tool);
 
       // Parse and filter candidates BEFORE claiming the session. Stop fires
       // every turn, including turns before any recall has happened; claiming on
@@ -709,7 +747,16 @@ const votesJudgeHandler: HookHandler = {
       // judge from ever running on the later turns that DO have recalls. So we
       // only spend the claim once there is real work to do.
       const { parseTranscriptForVotes } = await import('./transcript-parser.js');
-      const voteData = await parseTranscriptForVotes(transcriptPath);
+      // Codex, Muse and ZCode provide the reply directly. Their native session
+      // files are not Claude transcripts; use our settled recall log as evidence.
+      const { recalledDocsForSession } = await import('./recall-adoption.js');
+      const docs = finalReply ? await recalledDocsForSession(localConfig, dispatchSessionId) : [];
+      const voteData = finalReply ? {
+        finalAssistantText: finalReply,
+        recalledDocIds: docs.map(d => d.key),
+        recalledDocPaths: Object.fromEntries(docs.map(d => [d.key, d.path])),
+        recalledDocScopes: Object.fromEntries(docs.map(d => [d.key, d.scope])),
+      } : await parseTranscriptForVotes(transcriptPath!);
       if (voteData.recalledDocIds.length === 0) return null;
 
       // The session's upvote ledger holds every doc the hook path (or an earlier
@@ -723,7 +770,6 @@ const votesJudgeHandler: HookHandler = {
       // opened in this turn is then in the ledger and never sent to the judge.
       // Safe to run twice: the ledger and consumed marks dedupe it.
       const { creditAdoptedDocs, recalledKeyOf, recalledPathOf } = await import('./recall-adoption.js');
-      const dispatchSessionId = deriveDispatchSessionId(stdin, _tool);
       await creditAdoptedDocs(localConfig, dispatchSessionId);
       const { creditedDocIdsForSession } = await import('./votes.js');
       const ledgerCredited = await creditedDocIdsForSession(votePath, sessionId);
@@ -1133,6 +1179,7 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
     // on a slow network cannot delay session startup. Its own generous budget
     // (PULL_TIMEOUT_MS) — the shared 15s truncated the pull itself.
     { event: 'session-start', matcher: '*', handler: pullHandler, timeoutMs: PULL_TIMEOUT_MS, background: true },
+    { event: 'session-start', matcher: '*', handler: sessionCaptureHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
     { event: 'session-start', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
     { event: 'session-start', matcher: '*', handler: teamRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
     { event: 'session-start', matcher: '*', handler: cursorUserRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true, yieldsToContextLimit: true },

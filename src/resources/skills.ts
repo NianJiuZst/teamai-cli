@@ -9,6 +9,7 @@ import { log } from '../utils/logger.js';
 import { debugOnce, warnOnce } from '../utils/warn-once.js';
 import { getFileContentWhenAdded, isPastVersionOf, resolveAnchors } from '../utils/git.js';
 import { isCliOwnedSkillName, ownedSkillFiles, prunedWhole, removeOwnedFiles, skillsGuardBase } from '../builtin-skills.js';
+import { generatedSkillAt } from '../workflow/discovery/generated-marker.js';
 import { installOf, locate, ownOf, SHARED_AGENT_SKILLS_PATH, writable, writesOf, type Install } from '../locate.js';
 import {
   loadRolesManifest, resolveRoleResourceNamespaces, RolesManifestNotFoundError, type RolesManifest,
@@ -912,7 +913,7 @@ export async function resolveDestination(input: {
   }
   const open = await openPrDestinations({ pending: input.pending, name, repoPath });
   const awaiting = open.length > 1
-    ? open.find((o) => input.role !== undefined && recordedNamespace(o.recorded) === input.role)?.recorded
+    ? open.find((o) => input.role !== undefined && (recordedNamespace(o.recorded) ?? '') === input.role)?.recorded
     : open[0]?.recorded;
   if (!awaiting && open.length > 1) {
     // A namespace the flag names that none of them holds is a new destination: the flag places it.
@@ -990,6 +991,7 @@ export class SkillsHandler extends ResourceHandler {
         if (tombstones.has(dir)) continue;
         if (pushIgnoredSkills.has(dir)) continue;
         if (isCliOwnedSkillName(dir)) continue; // Skip CLI built-in skills, current and legacy
+        if ((await generatedSkillAt(localDirPath)).kind === 'ours') continue; // Pull writes it from a workflow
         if (sourceSkillNames.has(dir)) continue; // Quarantine legacy/unpinned names
         // Compare the file actually scanned, not a future deployment target:
         // recursive scans and Codex's shared directory can differ from that target.

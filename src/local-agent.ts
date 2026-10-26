@@ -23,7 +23,7 @@ import {
   writeJsonAtomic,
 } from './utils/fs.js';
 import { RulesHandler, SkillsHandler } from './resources/index.js';
-import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS } from './hooks.js';
+import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS, codexTrustPolicy, type CodexTrustPolicy } from './hooks.js';
 import { parseHookEvent } from './dashboard-collector.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { isInteractive } from './utils/prompt.js';
@@ -40,6 +40,7 @@ import {
   renderJsonEntry,
   renderCodexBlock,
   entryHash,
+  museEntryHash,
 } from './resources/mcp-format.js';
 import {
   readJsonDoc,
@@ -574,33 +575,30 @@ async function agentHookSettingsPaths(config: LocalAgentConfig | null, tool: str
   return [...new Set([settings, legacy ?? settings])].map((rel) => path.join(getUserHome(), rel));
 }
 
+async function memberCodexTrust(): Promise<CodexTrustPolicy> {
+  const { loadLocalConfig } = await import('./config.js');
+  return codexTrustPolicy(await loadLocalConfig() ?? {});
+}
+
 /** The member turned off teamai's Codex trust writes (`codexTrustEnabled: false`). */
 async function codexTrustDisabled(): Promise<boolean> {
   const { loadLocalConfig } = await import('./config.js');
   return (await loadLocalConfig())?.codexTrustEnabled === false;
 }
 
-/**
- * Remove a settings-file agent hook from every file it can sit in. In Codex,
- * the hooks after it move up, so the ones Codex trusted are trusted again.
- */
+function agentHookCodexTrust(disabled: boolean, settingsPath: string): CodexTrustPolicy {
+  return disabled ? { kind: 'disabled' } : { kind: 'enabled', codexHome: path.dirname(settingsPath) };
+}
+
+/** Remove a settings-file agent hook from every file it can sit in. */
 async function removeSettingsAgentHook(
   config: LocalAgentConfig | null,
   tool: string,
   opts: { slug: string; command?: string },
 ): Promise<void> {
-  const keepTrust = isCodexTrustGatedTool(tool) && !(await codexTrustDisabled());
+  const disabled = await codexTrustDisabled();
   for (const settingsPath of await agentHookSettingsPaths(config, tool)) {
-    const remove = () => removeAgentHook(settingsPath, tool, opts);
-    if (!keepTrust || !(await pathExists(settingsPath))) {
-      await remove();
-      continue;
-    }
-    const { keepCodexHookTrust } = await import('./codex-trust.js');
-    const trust = await keepCodexHookTrust({ codexHome: path.dirname(settingsPath), cwd: getUserHome(), file: settingsPath }, remove);
-    if (trust.kind === 'failed') {
-      log.warn(`Codex may skip the hooks after agent hook [${opts.slug}] in ${settingsPath} until you approve them in /hooks: ${trust.reason}`);
-    }
+    await removeAgentHook(settingsPath, tool, opts, agentHookCodexTrust(disabled, settingsPath));
   }
 }
 
@@ -3793,7 +3791,7 @@ async function runHookRuleCommand(
     }
   }
 
-  let codexTrustPath: string | undefined;
+  let codexTrust: { settingsPath: string; policy: CodexTrustPolicy } | undefined;
   if (tool === 'hermes') {
     const { applyHermesAgentHook } = await import('./hermes-hooks.js');
     await applyHermesAgentHook({ slug, event, command: cmd, matcher, timeout });
@@ -3809,16 +3807,17 @@ async function runHookRuleCommand(
     await applyPiAgentHook({ slug, event, command: cmd, matcher, timeout });
   } else {
     const [settingsPath] = await agentHookSettingsPaths(config, tool);
-    await applyAgentHook(settingsPath, tool, { slug, event, command: cmd, matcher, timeout });
-    if (isCodexTrustGatedTool(tool)) codexTrustPath = settingsPath;
+    const policy = agentHookCodexTrust(await codexTrustDisabled(), settingsPath);
+    await applyAgentHook(settingsPath, tool, { slug, event, command: cmd, matcher, timeout }, policy);
+    if (isCodexTrustGatedTool(tool)) codexTrust = { settingsPath, policy };
   }
   manifest[slug] = { tool, event, command: cmd, matcher, timeout };
   await saveAgentHookManifest(manifest);
-  if (codexTrustPath) {
+  if (codexTrust) {
     // Recorded first, so an uninstall still finds the hook Codex will not run.
-    const trust = await codexTrustDisabled()
+    const trust = codexTrust.policy.kind === 'disabled'
       ? { kind: 'disabled' as const }
-      : await trustCodexAgentHook(codexTrustPath, event, cmd);
+      : await trustCodexAgentHook(codexTrust.settingsPath, event, cmd);
     if (trust.kind !== 'trusted') {
       const why = trust.kind === 'disabled' ? 'codexTrustEnabled is false, so approve it in Codex /hooks' : 'reason' in trust ? trust.reason : trust.kind;
       throw new Error(`Codex will not run agent hook [${slug}] until it is trusted: ${why}`);
@@ -4017,6 +4016,7 @@ async function installMcpServer(
     const entry = renderJsonEntry(format, def);
     const serverKey = active ? mcpKeyOf(active) : place.key;
     const hash = entryHash(entry);
+    const valueHash = format === 'muse' ? museEntryHash(entry) : undefined;
     const allowBare = format === 'copilot' && projectScope;
     const doc = await readJsonDoc(targetFile, serverKey, allowBare, active?.projectKey);
     if (!doc) {
@@ -4037,7 +4037,7 @@ async function installMcpServer(
     // Existing ownership stays valid until the config write completes. New installs
     // still persist a provisional record before adding a Git exclusion (#882).
     if (!previousRecord) {
-      updateManifestRecord(manifest, manifestKey, { name: slug, hash, ...projectScope ? { resolved: credential } : {}, file: targetFile });
+      updateManifestRecord(manifest, manifestKey, { name: slug, hash, ...valueHash === undefined ? {} : { valueHash }, ...projectScope ? { resolved: credential } : {}, file: targetFile });
       await save();
     }
     if (credential) await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry);
@@ -4047,7 +4047,7 @@ async function installMcpServer(
     if (allowBare || previousRecord) {
       // Placement is evidence of a completed write, not just an attempted install.
       updateManifestRecord(manifest, manifestKey, {
-        name: slug, hash, ...projectScope ? { resolved: credential } : {}, ...allowBare ? { bare: doc.bare } : {}, file: targetFile,
+        name: slug, hash, ...valueHash === undefined ? {} : { valueHash }, ...projectScope ? { resolved: credential } : {}, ...allowBare ? { bare: doc.bare } : {}, file: targetFile,
       });
       // A record in the tool's other place goes with the copy there, once this write holds the server.
       if (otherKey && manifest[otherKey]) {
@@ -4727,6 +4727,7 @@ export async function initLocalAgentHttp(options: {
     getUserHome(),
     options.filterAgents,
     toolRoots,
+    await memberCodexTrust(),
   );
   log.success(`HTTP local agent initialized at ${getConfigPath()}`);
 }

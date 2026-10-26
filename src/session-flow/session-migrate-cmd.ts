@@ -11,13 +11,14 @@ import {
   SyncManager,
   getGitAuthor,
   defaultSyncMeta,
-  withSessionIndexLock,
   withSessionPublicationLock,
 } from './sync.js';
 import { isInteractive } from '../utils/prompt.js';
 import { setStderrOnly } from '../utils/logger.js';
 import {
+  REPORTS_ARCHIVE_BUSY,
   archiveBusyMessage,
+  archiveToReports,
   ask,
   authorForCwd,
   closeStdin,
@@ -432,16 +433,24 @@ async function migrateSession(sessionId: string | undefined, opts: MigrationOpti
         }
         return;
       }
-      const repoRoot = await resolveRepoRoot(opts.repoRoot, { materialize: !isDryRun() });
+      /** --json: the copy stays on this machine whatever happens to its archive, so say where it is. */
+      const archiveFailed = (code: string, reason: string, failedCopy: { sessionId?: string; cwd?: string } | undefined = copied) =>
+        ({ error: { code, message: `Copied as ${failedCopy?.sessionId} in ${failedCopy?.cwd}, but not archived: ${reason}` } });
+      let archive: Awaited<ReturnType<typeof resolveRepoRoot>>;
+      try {
+        archive = await resolveRepoRoot(opts.repoRoot, { dryRun: isDryRun() });
+      } catch (err) {
+        if (!json) throw err;
+        return archiveFailed('archive_failed', err instanceof Error ? err.message : String(err));
+      }
+      const { root: repoRoot, reports } = archive;
       // When expanded across directories, sessions do not belong to workCwd; author should come from the repo the session actually lives in
       const authorCwd = migratedTargets.find((t) => t.cwd)?.cwd ?? workCwd;
       const author = getGitAuthor(authorCwd);
 
-      const syncMgr = new SyncManager(repoRoot);
-      /** --json: the copy stays on this machine whatever happens to its archive, so say where it is. */
-      const archiveFailed = (code: string, reason: string, failedCopy: { sessionId?: string; cwd?: string } | undefined = copied) =>
-        ({ error: { code, message: `Copied as ${failedCopy?.sessionId} in ${failedCopy?.cwd}, but not archived: ${reason}` } });
-      const publication = await withSessionPublicationLock(repoRoot, async () => {
+      let stopped: MigrationResult | undefined;
+      /** Saves the migrated sessions into the archive at `root`: how many, or undefined once `stopped` holds why it stopped. */
+      const archiveInto = async (syncMgr: SyncManager, root: string): Promise<number | undefined> => {
         let saved = 0;
         let unarchived = 0;
         for (const t of migratedTargets) {
@@ -453,7 +462,10 @@ async function migrateSession(sessionId: string | undefined, opts: MigrationOpti
             { scrub: Boolean(opts.scrub), toolRootsFor },
           );
           if (readBack.status === 'failed') {
-            if (json) return archiveFailed(readBack.failure.code, readBack.failure.message);
+            if (json) {
+              stopped = archiveFailed(readBack.failure.code, readBack.failure.message);
+              return undefined;
+            }
             console.error(`\n  ✗ Not archived: ${readBack.failure.message}`);
             unarchived++;
             continue;
@@ -476,13 +488,14 @@ async function migrateSession(sessionId: string | undefined, opts: MigrationOpti
           meta.migration.targetPlatform = target;
           meta.migration.fidelityScore = t.fidelityScore;
           try {
-            const write = await withSessionIndexLock(repoRoot, async () => syncMgr.saveSession(session, meta));
+            const write = await syncMgr.saveSession(session, meta);
             if (write.status === 'busy') {
-              return archiveFailed('busy', `${archiveBusyMessage(repoRoot, write.lockPath)} Run it again once that has finished.`, t);
+              stopped = archiveFailed('busy', `${archiveBusyMessage(root, write.lockPath)} Run it again once that has finished.`, t);
+              return undefined;
             }
           } catch (err) {
-            const reason = err instanceof Error ? err.message : String(err);
-            return archiveFailed('archive_failed', reason, t);
+            stopped = archiveFailed('archive_failed', err instanceof Error ? err.message : String(err), t);
+            return undefined;
           }
           saved++;
         }
@@ -490,34 +503,67 @@ async function migrateSession(sessionId: string | undefined, opts: MigrationOpti
           console.error(`\n  ✗ ${unarchived} migrated session(s) could not be read back and were not archived.`);
           process.exitCode = 1;
         }
-        // [fixed] a gitCommit failure (not a git directory / index.lock race) used to crash with a raw stack trace
-        // Under --json a throw reaches the action's catch, which prints the envelope; runGitStep would exit without one.
-        const commitArchive = () => syncMgr.gitCommit(`sync: migrate ${saved} session(s) ${source}→${target}`);
-        const commit = json ? commitArchive() : runGitStep(commitArchive, repoRoot, 'git commit');
-        if (commit.status === 'committed') {
-          const pushed = await pushToRemote(syncMgr, repoRoot);
-          if (pushed) {
-            console.log(`\n  ✓ Pushed ${saved} session(s) to team repo`);
-          } else {
-            console.log(`\n  · ${saved} session(s) committed locally but not pushed`);
-            process.exitCode = 1;
-            if (json) {
-              return archiveFailed(
-                'archive_failed',
-                `committed in ${repoRoot} as ${commit.commit.slice(0, 8)}, but the push to the remote failed (reason on stderr).`,
-              );
+        return saved;
+      };
+      const commitMessage = (saved: number) => `sync: migrate ${saved} session(s) ${source}→${target}`;
+      // Archive changes and their Git publication are serialized per team repo, the teamai-reports archive included.
+      const publication = await withSessionPublicationLock(repoRoot, async (): Promise<MigrationResult | undefined> => {
+        if (reports) {
+          const archived = await archiveToReports(reports, archiveInto, commitMessage);
+          switch (archived.status) {
+            case 'busy':
+              return archiveFailed('busy', REPORTS_ARCHIVE_BUSY);
+            case 'stopped':
+              return stopped;
+            case 'published':
+              console.log(`\n  ✓ Pushed ${archived.saved} session(s) to team repo`);
+              break;
+            case 'already-present':
+              console.log(`\n  · No changes to push\n`);
+              break;
+            case 'failed':
+              console.error(`\n  ✗ ${archived.saved} session(s) not pushed to teamai-reports: ${safeText(archived.reason)}`);
+              process.exitCode = 1;
+              if (json) return archiveFailed('archive_failed', `the push to teamai-reports failed: ${safeText(archived.reason)}`);
+              break;
+            default: {
+              const unhandled: never = archived;
+              return unhandled;
             }
           }
-          console.log(`  commit: ${commit.commit.slice(0, 8)}`);
-        } else if (commit.status === 'failed') {
-          // Hooks / gpg / missing identity: the archive files are still
-          // staged. Say so, and fail -- "No changes to push" here would hide
-          // a broken archive.
-          console.error(`\n  ✗ Commit failed, ${saved} session(s) left staged in ${repoRoot}: ${safeText(commit.reason)}`);
-          process.exitCode = 1;
-          if (json) return archiveFailed('archive_failed', `the commit failed, files left staged in ${repoRoot}: ${safeText(commit.reason)}`);
         } else {
-          console.log(`\n  · No changes to push\n`);
+          const syncMgr = new SyncManager(repoRoot);
+          const saved = await archiveInto(syncMgr, repoRoot);
+          if (saved === undefined) return stopped;
+          // [fixed] a gitCommit failure (not a git directory / index.lock race) used to crash with a raw stack trace
+          // Under --json a throw reaches the action's catch, which prints the envelope; runGitStep would exit without one.
+          const commitArchive = () => syncMgr.gitCommit(commitMessage(saved));
+          const commit = json ? commitArchive() : runGitStep(commitArchive, repoRoot, 'git commit');
+          if (commit.status === 'committed') {
+            const pushed = await pushToRemote(syncMgr, repoRoot);
+            if (pushed) {
+              console.log(`\n  ✓ Pushed ${saved} session(s) to team repo`);
+            } else {
+              console.log(`\n  · ${saved} session(s) committed locally but not pushed`);
+              process.exitCode = 1;
+              if (json) {
+                return archiveFailed(
+                  'archive_failed',
+                  `committed in ${repoRoot} as ${commit.commit.slice(0, 8)}, but the push to the remote failed (reason on stderr).`,
+                );
+              }
+            }
+            console.log(`  commit: ${commit.commit.slice(0, 8)}`);
+          } else if (commit.status === 'failed') {
+            // Hooks / gpg / missing identity: the archive files are still
+            // staged. Say so, and fail -- "No changes to push" here would hide
+            // a broken archive.
+            console.error(`\n  ✗ Commit failed, ${saved} session(s) left staged in ${repoRoot}: ${safeText(commit.reason)}`);
+            process.exitCode = 1;
+            if (json) return archiveFailed('archive_failed', `the commit failed, files left staged in ${repoRoot}: ${safeText(commit.reason)}`);
+          } else {
+            console.log(`\n  · No changes to push\n`);
+          }
         }
       });
       if (publication.status === 'busy') return archiveFailed('busy', archiveBusyMessage(repoRoot, publication.lockPath));
@@ -551,7 +597,7 @@ export function registerMigrationCommand(sessionCmd: Command, isDryRun: () => bo
     .option('--cwd <path>', 'Working directory (defaults to current directory)')
     .option('--target-cwd <path>', 'Override cwd for the target session')
     .option('--push', 'Also push the migrated session to the team repo')
-    .option('--repo-root <path>', 'Team repo root (for --push)')
+    .option('--repo-root <path>', 'Team repo clone to archive into with --push (default: the teamai install for this directory, else your user install)')
     .option('--scrub', 'Redact secrets (tokens/keys/passwords) from the session before writing it')
     .option('--all', 'Migrate every session from source (not just the 5 most recent)')
     .option('--limit <n>', 'Max sessions to migrate (only caps --all; ignored otherwise)')

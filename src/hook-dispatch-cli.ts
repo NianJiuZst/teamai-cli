@@ -419,6 +419,7 @@ export async function hookDispatchCli(
   matcher: string,
   options: { bgOnly?: boolean; copilotGlobal?: string; stdinFile?: string; hookArgs?: string[] } = {},
 ): Promise<void> {
+  if (process.env.TEAMAI_LAUNCHED_BY === 'scorer') return;
   const { bgOnly = false, stdinFile } = options;
   setStderrOnly(true);
   if (claudeHookRunsInAnotherHost(tool, process.env, false)) {
@@ -439,6 +440,20 @@ export async function hookDispatchCli(
       : fromGit ? JSON.stringify({ cwd: process.cwd(), git_args: options.hookArgs ?? [] })
         : await readStdin();
     const stdin = parseStdin(raw, event);
+
+    // Dynamic imports and handlers may resolve paths through process.cwd().
+    // A removed worktree has no usable process cwd. Preserve a supplied payload
+    // cwd; recover an omitted one from session history before using a live directory.
+    try {
+      process.cwd();
+    } catch {
+      process.chdir(os.tmpdir());
+      if (!resolveHookCwd(stdin)) {
+        const { recordedHookCwd } = await import('./dashboard-collector.js');
+        const previousCwd = await recordedHookCwd(stdin, tool);
+        if (previousCwd) stdin.cwd = previousCwd;
+      }
+    }
 
     // Config gates: a directory without teamai runs no team handlers (#748), and
     // HTTP-only teams must not receive git-provider-only hook prompts
@@ -488,6 +503,18 @@ export async function hookDispatchCli(
     if (bgOnly) {
       await runDispatch(dispatcher, event, matcher, stdin, tool, 'background');
       return;
+    }
+
+    // What the session starts as, read before the detached pull can deliver a new revision into the checkout (#1178),
+    // with the one git state the dashboard's session_start event records too.
+    if (event === 'session-start' && localConfig) {
+      const { GIT_AT_START_PAYLOAD_KEY, readGitStateAtStart } = await import('./dashboard-collector.js');
+      if (cwd) stdin[GIT_AT_START_PAYLOAD_KEY] = await readGitStateAtStart(cwd);
+      else delete stdin[GIT_AT_START_PAYLOAD_KEY];
+      const { CAPTURE_PAYLOAD_KEY, SessionCaptures } = await import('./session-flow/captures.js');
+      const captureId = await SessionCaptures.atStart(localConfig, tool, stdin, process.env);
+      if (captureId) stdin[CAPTURE_PAYLOAD_KEY] = captureId;
+      else delete stdin[CAPTURE_PAYLOAD_KEY];
     }
 
     // Parent: kick off background handlers in a detached process first so they

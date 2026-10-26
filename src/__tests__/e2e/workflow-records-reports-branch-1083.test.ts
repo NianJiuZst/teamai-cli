@@ -8,10 +8,12 @@ import { getCurrentVersion } from '../../package-info.js';
 import type { LocalConfig, TeamaiConfig } from '../../types.js';
 import { syncWorkflowDefinitions } from '../../workflow/cache.js';
 import { startRun } from '../../workflow/engine.js';
-import { localDriver, runLocalDriver } from '../../workflow/local-driver.js';
-import { createLocalToolAdapter, type ToolSpawn } from '../../workflow/local-tool-adapter.js';
+import { runLocalDriver } from '../../workflow/drivers/local/local-driver.js';
+import { driverIdentity } from '../../driver-identity.js';
+import { createLocalToolAdapter, type ToolSpawn } from '../../workflow/drivers/local/local-tool-adapter.js';
 import { pendingRecords } from '../../workflow/records.js';
 import { fakeClaude, recordDelivery } from '../helpers/delivered-checkout.js';
+import { knownSecrets } from '../../env-resolution.js';
 
 // #1083 end-to-end: a real git clone with a real bare origin, driven through
 // the engine the CLI uses. The run record and the workflow stats totals must
@@ -99,7 +101,7 @@ describe('#1083 workflow run records reach the reports branch', () => {
     const claude: ToolSpawn = (_command, _args, options) => spawn(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(stream)})`], options);
 
     await syncWorkflowDefinitions(config);
-    const started = await startRun(config, 'build', {}, { driver: localDriver(work) });
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), driver: driverIdentity('local', work) });
     expect(started).toMatchObject({ data: { status: 'running', record: 'published' } });
     const runId = String((started as { data: { run: string } }).data.run);
 
@@ -144,7 +146,7 @@ describe('#1083 workflow run records reach the reports branch', () => {
           definition: { name: 'reviewer', applied: 'main' },
           tool: { name: 'claude', version: '2.1.301' },
           model: { requested: 'claude-opus-4-1', reported: 'claude-opus-4-1-20250805' },
-          team: { revision: git(repo, 'rev-parse', rev).trim(), localChanges: false },
+          team: { revision: git(repo, 'rev-parse', rev).trim(), localChanges: false, selection: { scope: 'user', additionalRoles: [] } },
           teamai: getCurrentVersion(),
           driver: 'local',
           fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),

@@ -2,9 +2,9 @@ import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readWorkspaceChildren } from './workspace-children.js';
-import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
-import { deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
-import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, DetachedTeamRepoError, pushRepoDirectly, autoPushViaMR, gitBlockTimeoutMs } from './utils/git.js';
+import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, refreshRoleAssignment, saveStateForScope, resolveProjectDataHome } from './config.js';
+import { codexTrustPolicy, deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
+import { configureGitUser, resolveAnchors, initRepo, isGitRepo, getRemoteUrl, getConfiguredRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, DetachedTeamRepoError, pushRepoDirectly, autoPushViaMR, gitBlockTimeoutMs, createGitWithBlockTimeout } from './utils/git.js';
 import { withTimeout } from './utils/async.js';
 import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
 import { parseGenericGitExistingRemote } from './providers/git/repo-url.js';
@@ -12,6 +12,8 @@ import { probeSelfHostedGitLab } from './providers/gitlab/probe.js';
 import { ensureDir, writeFile, writeFileAtomic, pathExists, expandHome, readFileSafe, remove } from './utils/fs.js';
 import { queueOwner, sameQueueOwner, setAsideQueueOnModeSwitch } from './utils/pending-learnings.js';
 import { dropAllSearchIndexes } from './utils/search-index.js';
+import { reportsBranch } from './utils/reports-branch.js';
+import { learningsBranch } from './utils/learnings-branch.js';
 
 /**
  * A re-init that changes the install's kind or team repository keeps the data
@@ -97,6 +99,7 @@ import {
 } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { describeRoles, listRoleIds, loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
+import { loadRoleAssignmentsIfPresent, resolveAssignedRoles, ROLE_ASSIGNMENTS_FILE } from './role-assignments.js';
 import { loadProjectsManifest, listProjectIds, type ProjectsManifest } from './projects.js';
 import { memberReadRoots, readMemberConfig, mergeMemberConfig } from './members.js';
 import { noDryRunPreview } from './dry-run-guard.js';
@@ -169,8 +172,9 @@ async function releasePreviousToolRoots(
     if (!before || before === settingsOf(next)) continue;
     const oldSettings = path.join(hookScope.baseDir, before);
     if (await pathExists(oldSettings) && await hasTeamaiHooks(oldSettings, tool, hookScope.manifestPath)) {
+      const previousRootCodexTrust = codexTrustPolicy({ codexTrustEnabled: next.codexTrustEnabled, toolRoots: previous.toolRoots });
       // With the manifest, so team hooks go too — removeHooks() alone keeps them.
-      await reconcileHooks(oldSettings, tool, [], { removeAll: true, manifestPath: hookScope.manifestPath });
+      await reconcileHooks(oldSettings, tool, [], { removeAll: true, manifestPath: hookScope.manifestPath, codexTrust: previousRootCodexTrust });
     }
     if (next.scope === 'user') {
       // The user-scope MCP file and the gateway env are addressed through the
@@ -235,9 +239,28 @@ function parseRoleSelection(answer: string, max: number): number[] {
 class NoRoleSelectedError extends Error {}
 
 async function promptForRoleProfile(
-  repoPath: string,
+  repo: { localPath: string; kind?: string },
+  username: string,
   roleFlag?: string,
 ): Promise<Pick<LocalConfig, 'primaryRole' | 'additionalRoles' | 'resourceProfileVersion'>> {
+  const repoPath = repo.localPath;
+  // The team assigns roles (#1186): there is nothing to pick, and nothing to
+  // write — every load reads the assignment from the team repo.
+  const assignments = await loadRoleAssignmentsIfPresent(repoPath, repo);
+  if (assignments) {
+    if (roleFlag) {
+      throw new Error(
+        `Roles are assigned in ${ROLE_ASSIGNMENTS_FILE} in the team repo, so --role cannot set one. `
+        + 'Open a merge request against that file, or ask a code owner of manifest/ to.',
+      );
+    }
+    const { roles } = resolveAssignedRoles(assignments, username);
+    log.info(roles.length > 0
+      ? `Roles assigned to ${username} in ${ROLE_ASSIGNMENTS_FILE}: ${roles.join(', ')}`
+      : `No roles assigned to ${username} in ${ROLE_ASSIGNMENTS_FILE}; you receive shared resources only.`);
+    return { additionalRoles: [] };
+  }
+
   const manifest = await loadRolesManifest(repoPath);
   const roleLabels = describeRoles(manifest.roles);
 
@@ -571,12 +594,35 @@ async function newTeamConfigProvider(input: string, providerName: string, forced
   );
 }
 
+/** Init and later readers must agree on the repository that owns a workspace. */
+async function resolveInitContext(scopeFlag: string | undefined) {
+  const cwd = await fs.promises.realpath(process.cwd());
+  const root = scopeFlag === 'user' ? cwd : (await resolveAnchors(cwd))?.workspaceRoot ?? cwd;
+  const resolved = resolveInitScope(scopeFlag, root, getUserHome());
+  const inside = resolved.scope === 'project' && resolved.projectRoot !== cwd;
+  // A rejected init must not migrate roles, adopt a partition or bootstrap the ancestor.
+  const existingLocalConfig = await loadLocalConfigForScope(resolved.scope, resolved.projectRoot,
+    inside ? { dryRun: true, suppressMigrationNotice: true, selfHeal: false } : undefined);
+  const existingFile = inside && resolved.projectRoot && (
+    await pathExists(path.join(await resolveProjectDataHome(resolved.projectRoot, { dryRun: true }), 'config.yaml'))
+    || await pathExists(path.join(resolved.projectRoot, '.teamai', 'config.yaml'))
+  );
+  if (inside && (existingLocalConfig || existingFile)) {
+    throw new Error(
+      `${cwd} is inside the repository ${resolved.projectRoot}, which already has a workspace config. `
+      + 'A plain folder inside a repository cannot have its own config; only repositories are children of a workspace. '
+      + `Run teamai init in ${resolved.projectRoot} to change that config, or make ${cwd} a repository of its own.`,
+    );
+  }
+  return { ...resolved, existingLocalConfig };
+}
+
 function printScopeSummary(
   scope: Scope,
   projectRoot: string | undefined,
   explicit: boolean,
+  configPath: string,
 ): void {
-  const configPath = getConfigPath(scope, projectRoot);
   const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : getUserHome();
   log.info(`Scope: ${installScopeName(scope)}${scope === 'project' ? ` (${projectRoot})` : ''}`);
   log.info(`  config    → ${configPath}`);
@@ -616,18 +662,14 @@ export async function initHttp(
   let projectRoot: string | undefined;
   let explicit: boolean;
   let fallbackReason: string | undefined;
+  let existingLocalConfig: LocalConfig | null;
   try {
-    ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
-      options.scope,
-      process.cwd(),
-      getUserHome(),
-    ));
+    ({ scope, projectRoot, explicit, fallbackReason, existingLocalConfig } = await resolveInitContext(options.scope));
   } catch (e) {
     log.error((e as Error).message);
     process.exit(1);
     return;
   }
-  const existingLocalConfig = await loadLocalConfigForScope(scope, projectRoot);
   let inheritUserScope: boolean | undefined;
   try {
     inheritUserScope = resolveInheritUserScope(
@@ -646,7 +688,7 @@ export async function initHttp(
   const teamaiHome = scope === 'project' && projectRoot
     ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
     : getTeamaiHome(scope, projectRoot);
-  printScopeSummary(scope, projectRoot, explicit);
+  printScopeSummary(scope, projectRoot, explicit, path.join(teamaiHome, 'config.yaml'));
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
     log.warn(`cwd is not inside a git repository; will create ${teamaiHome}/`);
@@ -700,7 +742,7 @@ export async function initHttp(
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
   };
   try {
-    Object.assign(localConfig, await promptForRoleProfile(localPath, options.role));
+    Object.assign(localConfig, await promptForRoleProfile(localConfig.repo, localConfig.username, options.role));
   } catch (error) {
     // Two cases leave the role unset on purpose: a repo with no roles manifest,
     // and a person who skipped the prompt. Anything else — a manifest that does
@@ -710,6 +752,11 @@ export async function initHttp(
     const lenient = error instanceof RolesManifestNotFoundError || error instanceof NoRoleSelectedError;
     if (!lenient) throw error;
   }
+  // The team's assignment, if it has one (#1186). This config is handed to the
+  // hook, MCP and env reconciliation below before any load can overlay it, and
+  // a role-less config matches every role-scoped entry. Runtime-only: the save
+  // writes the member's own selection, which an assignment leaves empty.
+  await refreshRoleAssignment(localConfig);
   Object.assign(localConfig, await resolveProjectsForInit(localPath, options.project));
 
   // Persist --agent into enabledAgents (additive across runs)
@@ -1309,7 +1356,7 @@ export async function initSelfRepo(options: GlobalOptions & {
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
   };
   try {
-    Object.assign(localConfig, await promptForRoleProfile(localPath, options.role));
+    Object.assign(localConfig, await promptForRoleProfile(localConfig.repo, localConfig.username, options.role));
   } catch (error) {
     // Two cases leave the role unset on purpose: a repo with no roles manifest,
     // and a person who skipped the prompt. Anything else — a manifest that does
@@ -1319,6 +1366,11 @@ export async function initSelfRepo(options: GlobalOptions & {
     const lenient = error instanceof RolesManifestNotFoundError || error instanceof NoRoleSelectedError;
     if (!lenient) throw error;
   }
+  // The team's assignment, if it has one (#1186). This config is handed to the
+  // hook, MCP and env reconciliation below before any load can overlay it, and
+  // a role-less config matches every role-scoped entry. Runtime-only: the save
+  // writes the member's own selection, which an assignment leaves empty.
+  await refreshRoleAssignment(localConfig);
   Object.assign(localConfig, await resolveProjectsForInit(localPath, options.project));
   // Which AI tools to set up in this repo (create skills dir + inject hooks +
   // commit their settings.json). Resolved from --agent, else HOME detection
@@ -1578,18 +1630,14 @@ export async function init(options: GlobalOptions & {
   let projectRoot: string | undefined;
   let explicit: boolean;
   let fallbackReason: string | undefined;
+  let existingLocalConfig: LocalConfig | null;
   try {
-    ({ scope, projectRoot, explicit, fallbackReason } = resolveInitScope(
-      options.scope,
-      process.cwd(),
-      getUserHome(),
-    ));
+    ({ scope, projectRoot, explicit, fallbackReason, existingLocalConfig } = await resolveInitContext(options.scope));
   } catch (e) {
     log.error((e as Error).message);
     process.exit(1);
     return;
   }
-  const existingLocalConfig = await loadLocalConfigForScope(scope, projectRoot);
   const teamaiHome = scope === 'project' && projectRoot
     ? (existingLocalConfig?.dataHome ?? await resolveProjectDataHome(projectRoot))
     : getTeamaiHome(scope, projectRoot);
@@ -1613,7 +1661,7 @@ export async function init(options: GlobalOptions & {
   if (fallbackReason) {
     log.warn(fallbackReason);
   }
-  printScopeSummary(scope, projectRoot, explicit);
+  printScopeSummary(scope, projectRoot, explicit, path.join(teamaiHome, 'config.yaml'));
 
   if (scope === 'project' && !(await isInsideGitRepo(process.cwd()))) {
     log.warn(`cwd is not inside a git repository; will create ${teamaiHome}/`);
@@ -1700,7 +1748,9 @@ export async function init(options: GlobalOptions & {
   // it clones it now or reuses one an earlier init left: settle that install
   // now, as the config save below would, instead of leaving its config to run
   // against this clone should init stop first.
+  let replacedInstallSettled = false;
   const settleReplacedInstall = async (): Promise<void> => {
+    if (replacedInstallSettled) return;
     const next: LocalConfig = {
       repo: { localPath, remote: repoInfo.httpsUrl },
       username,
@@ -1713,6 +1763,7 @@ export async function init(options: GlobalOptions & {
       ? !sameQueueOwner(queueOwner(existingLocalConfig), queueOwner(next))
       : await pathExists(existingConfigPath);
     if (replacesAnother) await settleModeSwitch(existingLocalConfig, next, () => moveConfigAside(existingConfigPath, next));
+    replacedInstallSettled = true;
   };
 
   if (await pathExists(localPath)) {
@@ -1723,14 +1774,19 @@ export async function init(options: GlobalOptions & {
       // kept serving the old clone's manifest). Compare ignoring credentials,
       // protocol, and .git suffix.
       const existingRemote = await getRemoteUrl(localPath);
-      if (existingRemote && !remotesMatch(existingRemote, repoInfo.httpsUrl)) {
+      // `git remote get-url` expands url.*.insteadOf. Compare the literal URL as
+      // well so a rewrite does not turn a same-repository re-init into a clone
+      // replacement (and consequently retire its queues and worktrees).
+      const configuredRemote = await getConfiguredRemoteUrl(localPath);
+      const sameRepo = [existingRemote, configuredRemote]
+        .some((remote) => remote !== null && remotesMatch(remote, repoInfo.httpsUrl));
+      if (existingRemote && !sameRepo) {
         log.warn(
           `Existing clone at ${localPath} points at a different repo ` +
           `(${redactGitCredentials(existingRemote)}), not ${repoInfo.httpsUrl}.`,
         );
         if (options.force) {
           log.info('Replacing it with a fresh clone (--force)');
-          await remove(localPath);
         } else {
           const confirmed = await askConfirmation(
             'Remove it and clone the requested repo? [y/N] ',
@@ -1743,7 +1799,59 @@ export async function init(options: GlobalOptions & {
             process.exit(1);
             return;
           }
-          await remove(localPath);
+        }
+        const previous: LocalConfig = {
+          ...existingLocalConfig,
+          repo: { localPath, remote: existingRemote },
+          username: existingLocalConfig?.username ?? username,
+          scope,
+          projectRoot,
+          additionalRoles: existingLocalConfig?.additionalRoles ?? [],
+          ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
+        };
+        const changesOwner = !sameQueueOwner(
+          queueOwner(previous),
+          queueOwner({ ...previous, repo: { localPath, remote: repoInfo.httpsUrl } }),
+        );
+        try {
+          // Hold both branch locks from inspection through removal or relocation;
+          // otherwise a writer can mutate a checkout while its Git dir moves.
+          await reportsBranch.withLock(previous, () => learningsBranch.withLock(previous, async () => {
+            const reportsOwned = await reportsBranch.ownsCheckout(previous);
+            const learningsOwned = await learningsBranch.ownsCheckout(previous);
+            const ownedCheckoutIsDirty =
+              (reportsOwned && await reportsBranch.isDirty(previous)) ||
+              (learningsOwned && await learningsBranch.isDirty(previous));
+            if (changesOwner && ownedCheckoutIsDirty) {
+              await settleReplacedInstall();
+              let aside = `${localPath}.previous`;
+              for (let n = 1; await pathExists(aside); n++) aside = `${localPath}.previous.${n}`;
+              await fs.promises.rename(localPath, aside);
+              log.warn(`Kept the old clone and its uncommitted side checkout(s) at ${aside}.`);
+              try {
+                await createGitWithBlockTimeout(aside).raw(['worktree', 'repair']);
+              } catch (e) {
+                throw new Error(
+                  `The old clone was kept at ${aside}, but Git could not repair its worktree links. ` +
+                    `Run \`git -C ${aside} worktree repair\` to recover them before retrying init. ` +
+                    `Git reported: ${(e as Error).message}`,
+                  { cause: e },
+                );
+              }
+            } else {
+              // A checkout not registered to this clone belongs to an older or
+              // different install. Leave it for the existing foreign-checkout
+              // handling instead of blocking replacement of the current clone.
+              if (reportsOwned) await reportsBranch.retireWhileLocked(previous);
+              if (learningsOwned) await learningsBranch.retireWhileLocked(previous);
+              await settleReplacedInstall();
+              await remove(localPath);
+            }
+          }));
+        } catch (e) {
+          log.error((e as Error).message);
+          process.exit(1);
+          return;
         }
       } else {
         log.info(`Repo already exists at ${localPath}, using existing clone`);
@@ -1947,7 +2055,7 @@ export async function init(options: GlobalOptions & {
   if (projectsManifest?.projects.length) {
     rolePromptedEarly = true;
     try {
-      roleProfile = await promptForRoleProfile(localPath, options.role);
+      roleProfile = await promptForRoleProfile({ localPath }, username, options.role);
     } catch (error) {
       const msg = (error as Error).message;
       if (msg.includes('Roles manifest not found')) {
@@ -2138,7 +2246,7 @@ export async function init(options: GlobalOptions & {
 
   if (!rolePromptedEarly) {
     try {
-      roleProfile = await promptForRoleProfile(localPath, options.role);
+      roleProfile = await promptForRoleProfile({ localPath }, username, options.role);
     } catch (error) {
       const msg = (error as Error).message;
       if (msg.includes('Roles manifest not found')) {
@@ -2150,6 +2258,9 @@ export async function init(options: GlobalOptions & {
     }
   }
   if (roleProfile) Object.assign(localConfig, roleProfile);
+  // As above: the assignment reaches hook, MCP and env reconciliation through
+  // this config, and is never written to disk.
+  await refreshRoleAssignment(localConfig);
 
   // Projects were resolved before member registration so both records agree.
   localConfig.projects = resolvedProjects;

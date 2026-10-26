@@ -1,7 +1,7 @@
 import { hookSettingsPath, hookToolPathsForConfig } from './types.js';
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
-import { migrateLegacyManagedHooks, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, removeCopilotGlobalBuiltins, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, trustCodexForScope, type HookStatus } from './hooks.js';
+import { codexTrustPolicy, migrateLegacyManagedHooks, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, removeCopilotGlobalBuiltins, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, trustCodexForScope, type HookStatus } from './hooks.js';
 import { applyBuiltinOverride, installedBuiltinHookDefs } from './builtin-hooks.js';
 import { resolveTeamHookEntries } from './resources/hooks.js';
 import { describeEntryFailure, describeOrigin, reportUndeliveredEntryNotices } from './namespaced-entries.js';
@@ -296,6 +296,7 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
         mainCheckout: await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths),
         // Self mode: and the team hooks in each tool's settings.local.json (#915).
         ...(isSelfMode(localConfig) ? { selfLocalTeamHooks: { relocate: false } } : {}),
+        codexTrust: codexTrustPolicy(localConfig),
     });
 
     const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];

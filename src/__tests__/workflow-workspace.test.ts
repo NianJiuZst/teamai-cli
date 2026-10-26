@@ -15,23 +15,29 @@ import type { LocalConfig } from '../types.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import * as engine from '../workflow/engine.js';
 import { leaseNext, parseReport, reportAttempt, startRun } from '../workflow/engine.js';
-import { _setDriverPollMs, runLocalDriver } from '../workflow/local-driver.js';
-import { cancelRun, respondToHitl, retryStep } from '../workflow/run-controls.js';
-import type { LocalToolAdapter } from '../workflow/local-tool-adapter.js';
+import { _setDriverPollMs, runLocalDriver } from '../workflow/drivers/local/local-driver.js';
+import { cancelRun, respondProvenance, respondToHitl, retryStep } from '../workflow/run-controls.js';
+import type { LocalToolAdapter } from '../workflow/drivers/local/local-tool-adapter.js';
 import { parseWorkflow } from '../workflow/parse.js';
-import { readRun, writeRun } from '../workflow/store.js';
-import type { DriverIdentity } from '../workflow/types.js';
+import { readRun, updateRun } from '../workflow/store.js';
+import type { DriverIdentity, RunState } from '../workflow/types.js';
 import { branchName } from '../workflow/workspace.js';
-import { pushIfOrigin, worktreePath } from '../workflow/worktree.js';
+import { applyBaseConfig, ensureWorktree, hooksPath, pushIfOrigin, worktreePath } from '../workflow/worktree.js';
 import { launchHoldsCheckout } from '../launch-context.js';
 import { teamDelivery } from '../pull.js';
 import { pendingRecords } from '../workflow/records.js';
+import { knownSecrets } from '../env-resolution.js';
 
 _setDriverPollMs(20);
 
+/** Saves an edited run file under its lock, as a hand edit or an older teamai leaves one. */
+async function saveRun(config: LocalConfig, run: RunState): Promise<void> {
+  await updateRun(config, run.id, {}, async () => ({ value: undefined, write: run }));
+}
+
 const dirs: string[] = [];
 
-async function fixture(yaml: string, inputs?: unknown): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
+async function fixture(yaml: string, inputs: unknown = {}): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-workspace-'));
   dirs.push(root);
   const knowledge = path.join(root, 'knowledge');
@@ -53,7 +59,7 @@ async function fixture(yaml: string, inputs?: unknown): Promise<{ config: LocalC
   };
   fs.writeFileSync(path.join(knowledge, 'workflows', 'build.yaml'), yaml);
   await syncWorkflowDefinitions(config);
-  const started = await startRun(config, 'build', inputs);
+  const started = await startRun(config, 'build', inputs, { secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   return { config, workspace, runId: String(started.data.run) };
 }
@@ -108,7 +114,7 @@ async function teamWorkspace(yaml: string): Promise<{ config: LocalConfig; works
   if (!config) throw new Error('project config was not found');
   config.workflows = { tools: { default: 'claude' }, max_parallel: 1 };
   await syncWorkflowDefinitions(config);
-  const started = await startRun(config, 'build');
+  const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
   if ('error' in started) throw new Error(started.error.message);
   return { config, workspace, runId: String(started.data.run) };
 }
@@ -177,6 +183,31 @@ steps:
 `);
     if (missing.ok) throw new Error('expected session.from of a step that is not a need to fail');
     expect(missing.diagnostics.map((item) => item.code)).toContain('bad_session');
+  });
+
+  it('roots worktrees at run.checkout when driven from another directory', async () => {
+    const yaml = `schemaVersion: v1alpha1
+name: build
+description: A step records the directory it ran in.
+steps:
+  - id: change
+    workspace: new
+    command: node -e "require('fs').writeFileSync('where.txt', process.cwd())"
+`;
+    const { config, workspace } = await fixture(yaml);
+    const side = path.join(path.dirname(workspace), 'side');
+    git(['worktree', 'add', '-q', '-b', 'side', side], workspace);
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), checkout: workspace });
+    if ('error' in started) throw new Error(started.error.message);
+    const runId = String(started.data.run);
+
+    await runLocalDriver(config, runId, side);
+
+    const run = await readRun(config, runId);
+    expect(run).toMatchObject({ steps: [{ id: 'change', status: 'succeeded' }] });
+    const branch = branchName(runId, 'change', 1);
+    expect(git(['show', `${branch}:where.txt`], workspace)).toBe(path.join(fs.realpathSync(workspace), path.relative(workspace, worktreePath(workspace, branch))));
+    expect(fs.existsSync(path.join(side, '.teamai', 'workflow-worktrees'))).toBe(false);
   });
 
   it('fails a command with no workspace when it changes the checkout, and leaves the file', async () => {
@@ -513,6 +544,39 @@ steps:
     expect(git(['show', `${branch}:new.txt`], bare)).toBe('yes');
   });
 
+  it('keeps the failure of a prompt that fails, and adds that the push of its commits failed', async () => {
+    const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
+name: build
+description: A prompt writes a file and fails, and origin refuses the push.
+steps:
+  - id: change
+    workspace: new
+    prompt: Change it.
+`);
+    config.workflows = { tools: { default: 'claude' }, max_parallel: 1 };
+    git(['remote', 'add', 'origin', path.join(path.dirname(workspace), 'missing.git')], workspace);
+    const adapter: LocalToolAdapter = {
+      async runInteractive() {
+        return { started: false, exitCode: 1, failure: { code: 'tool_failed', message: 'interactive is not used' } };
+      },
+      async run(_tool, input) {
+        fs.writeFileSync(path.join(input.cwd, 'new.txt'), 'yes');
+        return { started: true, exitCode: 1, failure: { code: 'tool_failed', message: 'claude exited with status 1' } };
+      },
+    };
+
+    await runLocalDriver(config, runId, workspace, { adapter });
+
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run missing');
+    const branch = branchName(runId, 'change', 1);
+    expect(run.steps.find((step) => step.id === 'change')).toMatchObject({
+      status: 'failed',
+      changes: { branch },
+      failure: { code: 'tool_failed', message: expect.stringMatching(new RegExp(`^claude exited with status 1\\. Step "change" committed on ${branch} in .*, but pushing it to origin failed\\.`)) },
+    });
+  });
+
   it('commits a writer whose only change is a new file when the repository hides untracked files from status', async () => {
     const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
 name: build
@@ -576,7 +640,7 @@ steps:
     const owner = driver(workspace);
     const base = { ref: 'HEAD', commit: git(['rev-parse', 'HEAD'], workspace).trim() };
     const modes = ['read-only', 'new', 'continue'] as const;
-    const leased = await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] });
+    const leased = await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } });
     const lease = 'data' in leased ? leased.data.lease as { attempt: string; revision: number; step: string; workspace?: { branch: string } } : undefined;
     if (!lease?.workspace) throw new Error(JSON.stringify(leased));
     expect(lease.step).toBe('edit.first');
@@ -585,7 +649,7 @@ steps:
       changes: { branch: lease.workspace.branch, base: base.commit, from: base.commit, to: base.commit, commits: [] },
     });
 
-    const other = await leaseNext(config, runId, driver(workspace, 'other'), { base, workspaceModes: [...modes] });
+    const other = await leaseNext(config, runId, driver(workspace, 'other'), { base, can: { workspace: [...modes] } });
 
     expect(other).toMatchObject({ data: { wait: { reason: expect.stringContaining('another driver') } } });
   });
@@ -647,7 +711,7 @@ steps:
 `);
     const owner = driver(workspace);
     const base = { ref: 'HEAD', commit: git(['rev-parse', 'HEAD'], workspace).trim() };
-    const leased = await leaseNext(config, runId, owner, { base, workspaceModes: ['read-only', 'new', 'continue'] });
+    const leased = await leaseNext(config, runId, owner, { base, can: { workspace: ['read-only', 'new', 'continue'] } });
     const lease = 'data' in leased ? leased.data.lease as { attempt: string; revision: number; workspace?: { branch: string } } : undefined;
     if (!lease?.workspace) throw new Error(JSON.stringify(leased));
     const changes = { branch: lease.workspace.branch, base: base.commit, from: base.commit, to: base.commit, commits: [] };
@@ -806,6 +870,34 @@ steps:
     expect(git(['show', `${branch}:.tclaude/settings.json`], workspace)).toBe('earlier');
   });
 
+  it('keeps a .github agent file an earlier step committed on the branch after a later step runs on the base', async () => {
+    const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
+name: build
+description: A later step runs without the Copilot instructions committed earlier, and the branch keeps them.
+steps:
+  - id: work
+    workspace: new
+    workflow:
+      steps:
+        - id: plant
+          workspace: continue
+          command: node -e "const fs=require('fs'); fs.mkdirSync('.github',{recursive:true}); fs.writeFileSync('.github/copilot-instructions.md','earlier')"
+        - id: check
+          needs: [plant]
+          workspace: continue
+          command: node -e "const fs=require('fs'); if (fs.existsSync('.github/copilot-instructions.md')) process.exit(2); fs.writeFileSync('ok.txt','yes')"
+`);
+
+    const done = await runLocalDriver(config, runId, workspace);
+
+    expect(done, JSON.stringify(done)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    const run = await readRun(config, runId);
+    const check = typeof run === 'object' ? run.steps.find((step) => step.id === 'work.check') : undefined;
+    const branch = check && 'changes' in check ? check.changes?.branch : 'none';
+    expect(git(['show', `${branch}:ok.txt`], workspace)).toBe('yes');
+    expect(git(['show', `${branch}:.github/copilot-instructions.md`], workspace)).toBe('earlier');
+  });
+
   it('fails a later step with base_config when an earlier step committed .github as a symlink, and leaves its target alone', async () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-outside-'));
     dirs.push(outside);
@@ -853,7 +945,7 @@ steps:
     fs.symlinkSync(outside, path.join(workspace, '.github'));
     execFileSync('git', ['add', '.github'], { cwd: workspace });
     execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'link'], { cwd: workspace });
-    const started = await startRun(config, 'build');
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
 
@@ -880,7 +972,7 @@ steps:
     fs.writeFileSync(path.join(workspace, '.github', 'agents', 'a.md'), 'agent');
     execFileSync('git', ['add', '.github'], { cwd: workspace });
     execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'agent'], { cwd: workspace });
-    const started = await startRun(config, 'build');
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in started) throw new Error(started.error.message);
     const runId = String(started.data.run);
 
@@ -1378,6 +1470,222 @@ steps:
     expect(await pushIfOrigin(repo, 'teamai/solo', [])).toBe('pushed');
   });
 
+  it.each([
+    ['copying the branch files aside', async ({ saved }: { dir: string; saved: string; apply: () => Promise<unknown> }) => {
+      fs.mkdirSync(`${saved}.partial`, { recursive: true });
+      fs.writeFileSync(path.join(`${saved}.partial`, '_conflicts'), '');
+    }],
+    ['after it took the branch files out', async ({ dir, apply }: { dir: string; saved: string; apply: () => Promise<unknown> }) => {
+      await apply();
+      fs.rmSync(path.join(dir, 'AGENTS.md'));
+    }],
+  ])('finishes the agent configuration reset a process killed while %s left', async (_when, killed) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-base-config-')));
+    dirs.push(root);
+    const repo = path.join(root, 'repo');
+    const commit = (text: string): string => {
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), text);
+      execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo });
+      execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'agents'], { cwd: repo });
+      return git(['rev-parse', 'HEAD'], repo).trim();
+    };
+    execFileSync('git', ['init', '-q', '-b', 'main', repo]);
+    const base = commit('base rules\n');
+    const head = commit('branch rules\n');
+    const opened = await ensureWorktree(repo, 'teamai/r/step/p1', head);
+    if ('error' in opened) throw new Error(opened.error);
+    const saved = path.join(root, 'attempt', 'overlay');
+    await killed({ dir: opened.dir, saved, apply: () => applyBaseConfig(opened.dir, base, hooksPath(repo), saved) });
+
+    expect(await applyBaseConfig(opened.dir, base, hooksPath(repo), saved, { resume: true })).toEqual({ ok: true, saved });
+
+    expect(fs.readFileSync(path.join(opened.dir, 'AGENTS.md'), 'utf8')).toBe('base rules\n');
+    expect(fs.readFileSync(path.join(saved, 'AGENTS.md'), 'utf8')).toBe('branch rules\n');
+    expect(fs.existsSync(`${saved}.partial`)).toBe(false);
+  });
+
+  it('fails the agent configuration reset to a base commit this checkout does not have, and leaves the branch agent files', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-base-config-'));
+    dirs.push(root);
+    const commitIn = (repo: string, text: string): string => {
+      execFileSync('git', ['init', '-q', '-b', 'main', repo]);
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), text);
+      execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo });
+      execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'agents'], { cwd: repo });
+      return git(['rev-parse', 'HEAD'], repo).trim();
+    };
+    const repo = path.join(root, 'repo');
+    const head = commitIn(repo, 'branch rules\n');
+    const elsewhere = commitIn(path.join(root, 'elsewhere'), 'base rules\n');
+    const opened = await ensureWorktree(repo, 'teamai/r/step/p1', head);
+    if ('error' in opened) throw new Error(opened.error);
+
+    const applied = await applyBaseConfig(opened.dir, elsewhere, hooksPath(repo), path.join(root, 'overlay'));
+
+    expect(applied).toEqual({ ok: false, message: expect.stringContaining(elsewhere) });
+    expect(fs.readFileSync(path.join(opened.dir, 'AGENTS.md'), 'utf8')).toBe('branch rules\n');
+  });
+
+  it.each([
+    ['git cannot check the base out', (repo: string) => {
+      fs.writeFileSync(path.join(repo, '.git', 'info', 'attributes'), 'AGENTS.md filter=boom\n');
+      for (const [key, value] of [['smudge', 'false'], ['clean', 'cat'], ['required', 'true']]) git(['config', `filter.boom.${key}`, value], repo);
+    }],
+    ['the base checks out different from its commit', (repo: string) => {
+      fs.writeFileSync(path.join(repo, '.git', 'info', 'attributes'), 'AGENTS.md text\n');
+    }],
+  ])('leaves the branch agent files, its index and no temporary copy when %s', async (_fault, fault) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-base-config-')));
+    dirs.push(root);
+    const repo = path.join(root, 'repo');
+    const commit = (text: string): string => {
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), text);
+      execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo });
+      execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'agents'], { cwd: repo });
+      return git(['rev-parse', 'HEAD'], repo).trim();
+    };
+    execFileSync('git', ['init', '-q', '-b', 'main', repo]);
+    const base = commit('base rules\r\n');
+    const head = commit('branch rules\n');
+    const opened = await ensureWorktree(repo, 'teamai/r/step/p1', head);
+    if ('error' in opened) throw new Error(opened.error);
+    fault(repo);
+    const temp = path.join(root, 'tmp');
+    fs.mkdirSync(temp);
+
+    const applied = await applyBaseConfig(opened.dir, base, hooksPath(repo), path.join(temp, 'overlay'));
+
+    expect(fs.readFileSync(path.join(opened.dir, 'AGENTS.md'), 'utf8')).toBe('branch rules\n');
+    expect(git(['status', '--porcelain'], opened.dir)).toBe('');
+    expect(fs.readdirSync(temp)).toEqual([]);
+    expect(applied).toEqual({ ok: false, message: expect.stringContaining(base) });
+  });
+
+  it('keeps the branch agent files when a step is retried after git could not check out the base agent configuration', async () => {
+    const { config, workspace } = await fixture(`schemaVersion: v1alpha1
+name: build
+description: A failed reset of the agent configuration leaves the branch copy for the retry.
+steps:
+  - id: work
+    workspace: new
+    workflow:
+      steps:
+        - id: plant
+          workspace: continue
+          command: node -e "require('fs').writeFileSync('AGENTS.md','branch rules\\n')" && git config filter.boom.smudge false && git config filter.boom.clean cat && git config filter.boom.required true && echo 'AGENTS.md filter=boom' > "$(git rev-parse --git-common-dir)/info/attributes"
+        - id: check
+          needs: [plant]
+          workspace: continue
+          command: node -e "require('fs').writeFileSync('ok.txt','yes')"
+`);
+    fs.writeFileSync(path.join(workspace, 'AGENTS.md'), 'base rules\n');
+    execFileSync('git', ['add', 'AGENTS.md'], { cwd: workspace });
+    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'agents'], { cwd: workspace });
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
+    if ('error' in started) throw new Error(started.error.message);
+    const runId = String(started.data.run);
+    const branch = branchName(runId, 'work', 1);
+
+    await runLocalDriver(config, runId, workspace);
+
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run missing');
+    expect(run.steps.find((step) => step.id === 'work.check')).toMatchObject({ status: 'failed', failure: { code: 'base_config', message: expect.stringContaining('smudge filter boom failed') } });
+    fs.rmSync(path.join(workspace, '.git', 'info', 'attributes'));
+    expect(await retryStep(config, runId, await knownSecrets(config), 'work.check')).toMatchObject({ data: { retried: { pass: 2 } } });
+
+    const done = await runLocalDriver(config, runId, workspace);
+
+    expect(done, JSON.stringify(done)).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(git(['show', `${branch}:AGENTS.md`], workspace)).toBe('branch rules\n');
+    expect(git(['show', `${branch}:ok.txt`], workspace)).toBe('yes');
+  });
+
+  it('fails a step with workspace_base, naming the branch, its commit and what git said, when a merge fails without a conflict', async () => {
+    const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
+name: build
+description: A merge git refuses is not a conflict.
+steps:
+  - id: left
+    needs: []
+    workspace: new
+    command: node -e "require('fs').writeFileSync('left.txt','L')"
+  - id: right
+    needs: []
+    workspace: new
+    command: node -e "require('fs').writeFileSync('in-the-way.txt','R')"
+  - id: join
+    needs: [left, right]
+    workspace: new
+    command: node -e "require('fs').writeFileSync('ok.txt','yes')"
+`);
+    const opened = await ensureWorktree(workspace, branchName(runId, 'join', 1), git(['rev-parse', 'HEAD'], workspace).trim());
+    if ('error' in opened) throw new Error(opened.error);
+    fs.writeFileSync(path.join(opened.dir, 'in-the-way.txt'), 'untracked\n');
+
+    await runLocalDriver(config, runId, workspace);
+
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run missing');
+    const right = run.steps.find((step) => step.id === 'right');
+    const commit = right && 'changes' in right ? right.changes?.to : undefined;
+    if (!commit) throw new Error('right reported no commit');
+    const join = run.steps.find((step) => step.id === 'join');
+    expect(join).toMatchObject({ status: 'failed', failure: { code: 'workspace_base' } });
+    const message = join && 'failure' in join ? join.failure?.message : undefined;
+    expect(message).toContain(`branch ${branchName(runId, 'right', 1)} at ${commit}`);
+    expect(message).toContain('untracked working tree files would be overwritten by merge');
+    expect(message).toContain(`teamai workflow retry ${runId} join`);
+    expect(fs.existsSync(path.join(opened.dir, 'ok.txt'))).toBe(false);
+  });
+
+  it('fails a step with workspace_base, committing nothing, when git cannot list its agent files to put the branch copy back', async () => {
+    const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
+name: build
+description: A listing git fails is not an empty one.
+steps:
+  - id: work
+    workspace: new
+    command: node -e "const cp=require('child_process'); require('fs').writeFileSync('ok.txt','yes'); require('fs').writeFileSync(cp.execFileSync('git',['rev-parse','--git-path','index']).toString().trim(),'garbage')"
+`);
+    const start = git(['rev-parse', 'HEAD'], workspace).trim();
+
+    await runLocalDriver(config, runId, workspace);
+
+    const run = await readRun(config, runId);
+    if (typeof run !== 'object') throw new Error('run missing');
+    const work = run.steps.find((step) => step.id === 'work');
+    expect(work).toMatchObject({ status: 'failed', failure: { code: 'workspace_base', message: expect.stringContaining('index file smaller than expected') } });
+    expect(work && 'failure' in work ? work.failure?.message : undefined).toContain('nothing was committed');
+    expect(git(['rev-parse', branchName(runId, 'work', 1)], workspace).trim()).toBe(start);
+  });
+
+  it('fails a reader with workspace_base when git cannot list its copy to put the branch agent files back', async () => {
+    const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
+name: build
+description: A reader whose copy git cannot list is not put back.
+steps:
+  - id: change
+    workspace: new
+    workflow:
+      steps:
+        - id: implement
+          workspace: continue
+          command: node -e "require('fs').writeFileSync('impl.txt','yes')"
+        - id: test
+          needs: [implement]
+          command: node -e "const cp=require('child_process'); require('fs').writeFileSync(cp.execFileSync('git',['rev-parse','--git-path','index']).toString().trim(),'garbage')"
+`);
+
+    await runLocalDriver(config, runId, workspace);
+
+    const run = await readRun(config, runId);
+    const test = typeof run === 'object' ? run.steps.find((step) => step.id === 'change.test') : undefined;
+    expect(test).toMatchObject({ status: 'failed', failure: { code: 'workspace_base', message: expect.stringContaining('could NOT be put back') } });
+    expect(test).toMatchObject({ failure: { message: expect.stringContaining('index file smaller than expected') } });
+    expect(test).not.toMatchObject({ failure: { message: expect.stringContaining('changed repository paths') } });
+  });
+
   it('commits a hook a step made executable without editing its text', async () => {
     const { config, workspace, runId } = await fixture(`schemaVersion: v1alpha1
 name: build
@@ -1638,7 +1946,7 @@ steps:
 
     const failed = await runLocalDriver(config, runId, workspace);
     expect(failed, JSON.stringify(failed)).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    const opened = await retryStep(config, runId, 'work.ask');
+    const opened = await retryStep(config, runId, await knownSecrets(config), 'work.ask');
     expect(opened, JSON.stringify(opened)).toMatchObject({ data: { retried: { pass: 2 } } });
     config.workflows = { tools: { default: 'claude' }, max_parallel: 1 };
     const adapter: LocalToolAdapter = {
@@ -2234,7 +2542,7 @@ steps:
     delete stored.failure;
     delete stored.end;
     stored.steps = stored.steps.map((step) => step.id === 'join' ? { id: step.id, status: 'pending' as const, pass: step.pass } : step);
-    await writeRun(config, stored);
+    await saveRun(config, stored);
 
     const second = await runLocalDriver(config, runId, workspace, { adapter });
 
@@ -2291,7 +2599,7 @@ steps:
     delete stored.failure;
     delete stored.end;
     stored.steps = stored.steps.map((step) => step.id === 'join' ? { id: step.id, status: 'pending' as const, pass: step.pass } : step);
-    await writeRun(config, stored);
+    await saveRun(config, stored);
 
     const second = await runLocalDriver(config, runId, workspace, { adapter });
 
@@ -2340,7 +2648,7 @@ setInterval(() => {}, 1000);
       if (Date.now() > deadline) throw new Error('the command did not start');
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-    expect(await cancelRun(config, runId, 'work.slow')).not.toHaveProperty('error');
+    expect(await cancelRun(config, runId, await knownSecrets(config), 'work.slow')).not.toHaveProperty('error');
     await driving;
     fs.writeFileSync(again, '');
     const stored = await readRun(config, runId);
@@ -2353,7 +2661,7 @@ setInterval(() => {}, 1000);
       if (step.id === 'work.slow') return { id: step.id, status: 'pending' as const, pass: step.pass };
       return step;
     });
-    await writeRun(config, stored);
+    await saveRun(config, stored);
 
     const second = await runLocalDriver(config, runId, workspace);
 
@@ -2392,7 +2700,7 @@ steps:
     const { config, workspace, runId } = await fixture(yaml);
     const owner = driver(workspace);
     const base = { commit: git(['rev-parse', 'HEAD'], workspace).trim() };
-    const implement = leaseOf(await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] }));
+    const implement = leaseOf(await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } }));
     const branch = branchName(runId, 'change', 1);
     expect(implement).toMatchObject({ step: 'change.implement', workspace: { mode: 'continue', branch } });
     const reported = await reportAttempt(config, runId, {
@@ -2406,7 +2714,7 @@ steps:
   it('leases a read-only step inside a copy on the branch its need wrote, merging nothing', async () => {
     const { config, runId, owner, base, branch } = await implemented();
 
-    const test = await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] });
+    const test = await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } });
 
     expect(test).toMatchObject({ data: { lease: { step: 'change.test', workspace: {
       mode: 'read-only', base: { commit: base.commit }, configCommit: base.commit, branch, start: { commit: commit('c') }, merge: [],
@@ -2416,11 +2724,14 @@ steps:
   it('holds a reader in a copy back from a driver without continue, and from a driver that does not own the copy', async () => {
     const { config, runId, owner, base, branch } = await implemented();
 
-    const reader = await leaseNext(config, runId, owner, { base, workspaceModes: ['read-only', 'new'] });
-    const other = await leaseNext(config, runId, driver(owner.workspace, 'other'), { base, workspaceModes: [...modes] });
+    const reader = await leaseNext(config, runId, owner, { base, can: { workspace: ['read-only', 'new'] } });
+    const other = await leaseNext(config, runId, driver(owner.workspace, 'other'), { base, can: { workspace: [...modes] } });
 
-    expect(reader).toEqual({ data: { wait: { reason: `step "change.test" reads workspace ${branch}, which needs continue` }, cancelled: [] } });
-    expect(other).toEqual({ data: { wait: { reason: 'step "change.test" reads a workspace owned by another driver' }, cancelled: [] } });
+    const needsContinue = `step "change.test" reads workspace ${branch}, which needs continue`;
+    const owned = 'step "change.test" reads a workspace owned by another driver';
+    expect(reader).toEqual({ data: { wait: { reason: needsContinue, held: [{ step: 'change.test', reason: needsContinue, missing: ['workspace.continue'] }] }, cancelled: [] } });
+    // Another driver owns the copy: this one lacks nothing, so `missing` is empty.
+    expect(other).toEqual({ data: { wait: { reason: owned, held: [{ step: 'change.test', reason: owned, missing: [] }] }, cancelled: [] } });
   });
 
   it('runs an item reader on its own item branch, after the items its item waits for, and publishes only writer branches', async () => {
@@ -2453,7 +2764,7 @@ steps:
     const base = { commit: git(['rev-parse', 'HEAD'], workspace).trim() };
     const ran = new Map<string, string | undefined>();
     for (;;) {
-      const next = await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] });
+      const next = await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } });
       if ('data' in next && next.data.done) break;
       const lease = leaseOf(next);
       const contract = lease.workspace;
@@ -2490,7 +2801,7 @@ steps:
 
   it('accepts read for a read-only lease, refuses changes or a success without read, and keeps the copy for the reader', async () => {
     const { config, runId, owner, base, branch } = await implemented();
-    const test = leaseOf(await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] }));
+    const test = leaseOf(await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } }));
     const read = { branch, base: base.commit, commit: commit('d') };
     const report = (fields: Partial<engine.ReportInput>) => reportAttempt(config, runId, {
       attempt: test.attempt, revision: test.revision, outcome: 'success', driver: owner, ...fields,
@@ -2507,14 +2818,14 @@ steps:
     const run = await readRun(config, runId);
     if (typeof run !== 'object') throw new Error('run missing');
     expect(run.steps.find((step) => step.id === 'change.test')).toMatchObject({ read });
-    expect(run.copies?.[branch]).toEqual({ owner, commit: commit('c') });
+    expect(run.copies?.[branch]).toEqual({ owner, commit: commit('c'), used: true });
   });
 
   it('keeps the copy when a writer reports while its reader is pending, and refuses read for a writable lease', async () => {
     const { config, workspace, runId } = await fixture(EXAMPLE);
     const owner = driver(workspace);
     const base = { commit: git(['rev-parse', 'HEAD'], workspace).trim() };
-    const implement = leaseOf(await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] }));
+    const implement = leaseOf(await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } }));
     const branch = branchName(runId, 'change', 1);
     const report = (fields: Partial<engine.ReportInput>) => reportAttempt(config, runId, {
       attempt: implement.attempt, revision: implement.revision, outcome: 'success', driver: owner, ...fields,
@@ -2628,7 +2939,7 @@ ${steps}`, steps.startsWith('inputs:') ? { items: ['a', 'b'] } : undefined);
     const open: Leased[] = [];
     const reported: Array<[string, boolean]> = [];
     for (let turn = 0; turn < 50; turn += 1) {
-      const next = await leaseNext(config, runId, owner, { base, workspaceModes: [...modes], hitl: true, running: open.map((lease) => lease.attempt) });
+      const next = await leaseNext(config, runId, owner, { base, can: { workspace: [...modes], hitl: true }, running: open.map((lease) => lease.attempt) });
       if ('error' in next) throw new Error(JSON.stringify(next));
       if (next.data.done) break;
       if (next.data.lease) {
@@ -2639,7 +2950,7 @@ ${steps}`, steps.startsWith('inputs:') ? { items: ['a', 'b'] } : undefined);
       if (!lease) {
         const hitl = next.data.hitl as { step: string } | undefined;
         if (!hitl) throw new Error(JSON.stringify(next));
-        await respondToHitl(config, runId, { step: hitl.step, choice: 'yes', channel: 'cli', agent: false });
+        await respondToHitl(config, runId, await knownSecrets(config), { step: hitl.step, choice: 'yes', provenance: respondProvenance({ kind: 'terminal', caller: { tty: true, evidence: { kind: 'none' } } }) });
         continue;
       }
       const contract = lease.workspace;
@@ -2862,7 +3173,7 @@ steps:
     const copy = worktreePath(workspace, branch);
     expect(fs.existsSync(path.join(copy, 'polish.txt'))).toBe(false);
     git(['checkout', '-q', '-b', branch], copy);
-    expect(await retryStep(config, runId, 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
+    expect(await retryStep(config, runId, await knownSecrets(config), 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
 
     const done = await runLocalDriver(config, runId, workspace);
 
@@ -2976,7 +3287,7 @@ steps:
     fs.writeFileSync(marker, staged);
     fs.writeFileSync(path.join(copy, 'junk.txt'), 'reader');
     fs.writeFileSync(path.join(workspace, 'go'), '');
-    expect(await retryStep(config, runId, 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
+    expect(await retryStep(config, runId, await knownSecrets(config), 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
 
     await runLocalDriver(config, runId, workspace);
 
@@ -2987,7 +3298,7 @@ steps:
     });
     expect(() => git(['show', `${branch}:junk.txt`], workspace)).toThrow();
     fs.rmSync(path.join(copy, 'junk.txt'));
-    expect(await retryStep(config, runId, 'change.polish')).toMatchObject({ data: { retried: { pass: 3 } } });
+    expect(await retryStep(config, runId, await knownSecrets(config), 'change.polish')).toMatchObject({ data: { retried: { pass: 3 } } });
 
     await runLocalDriver(config, runId, workspace);
 
@@ -3020,7 +3331,7 @@ steps:
     const copy = worktreePath(workspace, branch);
     git(['checkout', '-q', '--detach'], copy);
     fs.writeFileSync(path.join(workspace, 'go'), '');
-    expect(await retryStep(config, runId, 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
+    expect(await retryStep(config, runId, await knownSecrets(config), 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
 
     await runLocalDriver(config, runId, workspace);
 
@@ -3098,7 +3409,7 @@ steps:
     await runLocalDriver(config, runId, workspace);
     fs.rmSync(worktreePath(workspace, branch), { recursive: true, force: true });
     fs.writeFileSync(path.join(workspace, 'go'), '');
-    expect(await retryStep(config, runId, 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
+    expect(await retryStep(config, runId, await knownSecrets(config), 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
 
     await runLocalDriver(config, runId, workspace);
 
@@ -3163,7 +3474,7 @@ steps:
     await runLocalDriver(config, runId, workspace);
     fs.mkdirSync(path.resolve(copy, git(['rev-parse', '--git-path', 'teamai-unrestored'], copy).trim()));
     fs.writeFileSync(path.join(workspace, 'go'), '');
-    expect(await retryStep(config, runId, 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
+    expect(await retryStep(config, runId, await knownSecrets(config), 'change.polish')).toMatchObject({ data: { retried: { pass: 2 } } });
 
     await runLocalDriver(config, runId, workspace);
 
@@ -3604,14 +3915,14 @@ steps:
 `);
     const owner = driver(workspace);
     const base = { commit: git(['rev-parse', 'HEAD'], workspace).trim() };
-    const edit = leaseOf(await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] }));
+    const edit = leaseOf(await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } }));
     const branch = branchName(runId, 'edit', 1);
     await reportAttempt(config, runId, {
       attempt: edit.attempt, revision: edit.revision, outcome: 'success', driver: owner,
       changes: { branch, base: base.commit, from: base.commit, to: commit('c'), commits: [commit('c')] },
     });
 
-    const check = leaseOf(await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] }));
+    const check = leaseOf(await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } }));
 
     expect(check.step).toBe('check');
     expect(check).not.toHaveProperty('workspace');
@@ -3640,7 +3951,7 @@ steps:
     const owner = driver(workspace);
     const base = { commit: git(['rev-parse', 'HEAD'], workspace).trim() };
     for (const [step, to] of [['left', commit('1')], ['right', commit('2')]] as const) {
-      const leased = leaseOf(await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] }));
+      const leased = leaseOf(await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } }));
       expect(leased.step).toBe(`change.${step}`);
       await reportAttempt(config, runId, {
         attempt: leased.attempt, revision: leased.revision, outcome: 'success', driver: owner,
@@ -3648,7 +3959,7 @@ steps:
       });
     }
 
-    const done = await leaseNext(config, runId, owner, { base, workspaceModes: [...modes] });
+    const done = await leaseNext(config, runId, owner, { base, can: { workspace: [...modes] } });
 
     expect(done).toMatchObject({ data: { done: { outcome: 'failed' } } });
     const run = await readRun(config, runId);

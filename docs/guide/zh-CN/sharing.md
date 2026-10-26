@@ -23,7 +23,9 @@ teamai push
 teamai push --role pm
 ```
 
-没有 frontmatter 时，`push` 会补上 `name` 和 `description`。新 skill 写到你的角色或当前项目给出的 `skills/<ns>/<name>/`。有多个时会问。`--role` 指定一个。团队有 `manifest/roles.yaml` 或 `manifest/projects.yaml` 时，它必须由其中某个角色或项目声明。
+没有 frontmatter 时，`push` 会补上 `name` 和 `description`。新 skill 写到你的角色或当前项目给出的 `skills/<ns>/<name>/`。有多个时会问，并提供明确的共享根目录选项。`--role` 指定命名空间；`--shared` 把新资源放到整个团队共享的根目录，即使已有命名空间。它不能与 `--role` 或 `--project` 同用。已从命名空间交付的资源，编辑后仍回到原位置。选择命名空间且团队有 `manifest/roles.yaml` 或 `manifest/projects.yaml` 时，该空间必须由其中某个角色或项目声明。
+
+角色或项目过滤 skill 时，共享根目录的 skill 仍按原有 tags 订阅规则交付。`--shared` 选择的是发布位置。
 
 ## Rules
 
@@ -239,6 +241,8 @@ teamai mcp inject
 teamai mcp remove
 ```
 
+Muse 调整 JSON 对象的键顺序不会被视为个人修改。移除时会核对记录的内容（包括嵌套对象），仍会保留实际修改过命令、参数或环境变量的 server。旧记录如果没有内容指纹，需要团队 Git 历史中与原 hash 匹配的定义作为依据；无法证明时会保留 server 并提示。
+
 ## 模型
 
 `models/models.yaml` 自己 commit。密钥留在每人自己的机器上。只给一个项目时写 `models/<ns>/models.yaml`。
@@ -294,3 +298,5 @@ projects:
     resources:
       docs: [checkout]
 ```
+
+self 模式下，如果当前分支落后于默认分支，推送修改过的 skill 会在可能覆盖主干文件时以 exit 2 停止。检查覆盖整个 skill 目录，包括参考文件和删除操作，即使本地改的是另一个文件也会检查。先合并默认分支、解决 skill 差异，再重试；已包含主干修改的副本可以正常推送。

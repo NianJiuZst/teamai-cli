@@ -15,12 +15,16 @@ const lock = vi.hoisted(() => ({
 
 vi.mock('../session-flow/sync.js', async (importOriginal) => {
   const actual = (await importOriginal()) as typeof import('../session-flow/sync.js');
+  class MockSyncManager extends actual.SyncManager {
+    override commitRebuiltIndexes(indexes: string[]) {
+      return lock.heldBy
+        ? Promise.resolve({ status: 'busy' as const, lockPath: lock.heldBy })
+        : super.commitRebuiltIndexes(indexes);
+    }
+  }
   return {
     ...actual,
-    withSessionIndexLock: (async (repo, fn) =>
-      lock.heldBy
-        ? { status: 'busy', lockPath: lock.heldBy }
-        : actual.withSessionIndexLock(repo, fn)) as typeof actual.withSessionIndexLock,
+    SyncManager: MockSyncManager,
   };
 });
 
@@ -36,7 +40,12 @@ function git(cwd: string, ...args: string[]): string {
 
 function useGitConfig(extra = ''): void {
   const file = path.join(tmp, 'gitconfig');
-  fs.writeFileSync(file, `[user]\n\tname = tester\n\temail = tester@example.com\n${extra}`);
+  // GIT_CONFIG_GLOBAL replaces the isolated home's .gitconfig (whose
+  // gc/maintenance off-switch the setup file writes), so the switch is
+  // restated here: a commit or push otherwise leaves a detached
+  // `git gc --auto` writing objects/pack after the test returns (#1413) —
+  // the maxRetries rmSync below races that writer instead of removing it.
+  fs.writeFileSync(file, `[user]\n\tname = tester\n\temail = tester@example.com\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n${extra}`);
   process.env.GIT_CONFIG_GLOBAL = file;
   process.env.GIT_CONFIG_NOSYSTEM = '1';
 }
@@ -159,7 +168,9 @@ afterEach(() => {
   process.env.GIT_CONFIG_NOSYSTEM = savedEnv.nosystem;
   if (savedEnv.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
   if (savedEnv.nosystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
-  fs.rmSync(tmp, { recursive: true, force: true });
+  // A commit or push can leave a detached `git gc --auto` writing objects/pack
+  // after the test returns, so a single rmdir races it (ENOTEMPTY).
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe('SyncManager.gitPull', () => {

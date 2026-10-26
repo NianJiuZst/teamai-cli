@@ -167,15 +167,17 @@ export async function executePromotion(
   if (!['skills', 'rules', 'docs'].includes(category)) {
     throw new Error(`Invalid promotion category "${category}". Use skills, rules, or docs.`);
   }
-  const targetDir = path.join(repoPath, category);
-  const targetPath = path.join(targetDir, candidate.filename);
+  const relativePath = category === 'skills'
+    ? path.posix.join(category, candidate.filename.replace(/\.md$/i, ''), 'SKILL.md')
+    : path.posix.join(category, candidate.filename);
+  const targetPath = path.join(repoPath, relativePath);
   assertSafePath(targetPath, [repoPath]);
   if (await pathExists(targetPath)) {
     throw new Error(`Promotion target already exists: ${targetPath}. Nothing was overwritten.`);
   }
 
   if (options.dryRun) {
-    log.info(`[dry-run] Would promote ${candidate.docId} -> ${category}/${candidate.filename}`);
+    log.info(`[dry-run] Would promote ${candidate.docId} -> ${relativePath}`);
     return { targetPath, marked: null };
   }
 
@@ -185,7 +187,12 @@ export async function executePromotion(
   }
 
   // AI transforms the learning into a generalized format for the target category
-  const promotedContent = await generatePromotedContent(originalContent, category, candidate.title);
+  let promotedContent = await generatePromotedContent(originalContent, category, candidate.title);
+  if (category === 'skills') {
+    const { withSkillFrontmatter } = await import('../resources/skills.js');
+    const skillName = path.posix.basename(candidate.filename).replace(/\.md$/i, '');
+    promotedContent = withSkillFrontmatter(promotedContent, skillName);
+  }
   await ensureDir(path.dirname(targetPath));
   await writeNewFile(targetPath, promotedContent, { flag: 'wx' });
   await options.publish?.(targetPath);
@@ -195,7 +202,7 @@ export async function executePromotion(
   // by the next realign, and the same learning would be promoted again on the
   // next run, paying for another model call.
   const { data, content: body } = matter(originalContent);
-  data.promoted_to = `${category}/${candidate.filename}`;
+  data.promoted_to = relativePath;
   const updated = matter.stringify(body, data);
   const markPath = options.learningsWriteDir
     && !isInWriteRoot(candidate.path, options.learningsWriteDir)
@@ -204,7 +211,7 @@ export async function executePromotion(
   await ensureDir(path.dirname(markPath));
   await writeFile(markPath, updated);
 
-  log.success(`Promoted: ${candidate.docId} -> ${category}/${candidate.filename}`);
+  log.success(`Promoted: ${candidate.docId} -> ${relativePath}`);
   return { targetPath, marked: markPath };
 }
 
