@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { getUserHome, expandHome } from './utils/home.js';
@@ -504,9 +505,9 @@ export const DEFAULT_TOOL_PATHS = {
     },
   },
   // Kiro: skills, steering (rules), and custom agents sync to .kiro/. Kiro CLI
-  // 2.x stores lifecycle hooks inside each .kiro/agents/*.json config. The
-  // Kiro agent renderer therefore embeds TeamAI's session-start dispatch as
-  // `hooks.agentSpawn`; there is no standalone `settings` hook surface.
+  // V3 reads the standalone .kiro/hooks/teamai.json lifecycle hook. Legacy
+  // TeamAI agentSpawn entries are migrated out of agent files; Kiro 2.x
+  // does not support this standalone lifecycle integration.
   // MCP uses the dedicated, mcpServers-only .kiro/settings/mcp.json:
   // https://kiro.dev/docs/mcp/configuration/
   kiro: {
@@ -2489,6 +2490,13 @@ export const DEFAULT_CLAUDE_ROOT = '.claude';
 
 export const CODEX_TOOL_ID = 'codex';
 
+/** WorkBuddy's toolPaths id and pre-5.7 root segment (#946). */
+export const WORKBUDDY_TOOL_ID = 'workbuddy';
+export const WORKBUDDY_TOOL_ROOT = '.workbuddy';
+
+/** WorkBuddy 5.7+'s runtime root (#1273). */
+export const WORKBUDDY_NEW_GENERATION_ROOT = '.workbuddy-ai';
+
 /** Muse Code (Meta), whose CLI binary is `muse`. */
 export const MUSE_TOOL_ID = 'muse';
 
@@ -2880,6 +2888,34 @@ export function applyToolRoots(
 }
 
 /**
+ * WorkBuddy 5.7+ moved its runtime to `.workbuddy-ai/` and stops reading
+ * `.workbuddy/` (#1273), so skills go to the directory the app actually scans
+ * — live-verified in the issue (13 team skills showed in the live `/` menu).
+ * The new root wins whenever it exists, because an upgrade leaves the old one
+ * behind as an unread leftover. Only the default skills path swaps, so a team
+ * that redirected on purpose keeps its own. Every other surface keeps its
+ * `.workbuddy/` path: written there while that root exists, held by `locate`
+ * once it is gone. Returns the same object when no swap fires.
+ */
+function applyWorkBuddyGeneration(
+  toolPaths: Record<string, z.infer<typeof ToolPathsSchema>>,
+  localConfig: { scope?: Scope; projectRoot?: string },
+): Record<string, z.infer<typeof ToolPathsSchema>> {
+  const workbuddy = toolPaths[WORKBUDDY_TOOL_ID];
+  if (!workbuddy || workbuddy.skills !== '.workbuddy/skills') return toolPaths;
+  const baseDir = localConfig.scope === 'project' && localConfig.projectRoot !== undefined
+    ? localConfig.projectRoot
+    : getUserHome();
+  // The new root present means 5.7+ is the live generation (an upgrade leaves
+  // `.workbuddy/` behind as a leftover the app no longer reads), so it wins
+  // even when both roots exist (#1290).
+  if (fs.existsSync(path.join(baseDir, WORKBUDDY_NEW_GENERATION_ROOT))) {
+    return { ...toolPaths, [WORKBUDDY_TOOL_ID]: { ...workbuddy, skills: `${WORKBUDDY_NEW_GENERATION_ROOT}/skills` } };
+  }
+  return toolPaths;
+}
+
+/**
  * Return `teamConfig.toolPaths` with per-scope path overrides applied.
  *
  * Almost every tool keeps its user-scope and project-scope resources at the same
@@ -2904,8 +2940,9 @@ export function scopedToolPaths(
   localConfig: { scope?: Scope; toolRoots?: Readonly<Record<string, string>> },
   at?: HomePaths,
 ): Record<string, z.infer<typeof ToolPathsSchema>> {
-  if (localConfig.scope !== 'user') return teamConfig.toolPaths;
-  const rooted = applyToolRoots(teamConfig.toolPaths, localConfig.toolRoots, at);
+  const generationAdjusted = applyWorkBuddyGeneration(teamConfig.toolPaths, localConfig);
+  if (localConfig.scope !== 'user') return generationAdjusted;
+  const rooted = applyToolRoots(generationAdjusted, localConfig.toolRoots, at);
   const out: Record<string, z.infer<typeof ToolPathsSchema>> = {};
   for (const [tool, paths] of Object.entries(rooted)) {
     const us = paths.userScope;
@@ -2929,7 +2966,10 @@ export function scopedToolPaths(
   // Copilot loads user hooks only from files directly in `$COPILOT_HOME/hooks/`.
   const copilot = out[COPILOT_TOOL_ID];
   if (copilot?.hooks) out[COPILOT_TOOL_ID] = { ...copilot, hooks: `hooks/${path.basename(copilot.hooks)}` };
-  return out;
+  // Re-apply the WorkBuddy generation swap after the user-scope merge: a
+  // `userScope.skills` carrying the default `.workbuddy/skills` restores the
+  // unread old path over the adjusted one (#1290).
+  return applyWorkBuddyGeneration(out, localConfig);
 }
 
 /** True when the local config is single-repo mode (the business repo is the team repo). */

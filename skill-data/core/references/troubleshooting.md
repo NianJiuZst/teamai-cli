@@ -269,7 +269,7 @@ broken machine):
 | Codex                 | Installed and trusted     | Codex runs only trusted hooks; teamai trusts the ones it writes through `codex app-server`, and `teamai doctor` names any Codex will not run |
 | Cursor                | Installed                 | Also runs `~/.claude/settings.json`. That copy exits only when `~/.cursor/hooks.json` or the project `.cursor/hooks.json` contains `--tool cursor` |
 | Copilot CLI           | Installed                 | Built-ins use `$COPILOT_HOME/hooks/teamai.json` (default `~/.copilot/hooks/teamai.json`); self mode keeps them in the project. Claude built-ins exit for a valid, enabled version-1 file, global or project, with a `--tool copilot` command; self mode checks only the project directory. A Claude team hook exits only when a valid, enabled project version-1 file delivers the same command to Copilot for the same event and matcher. `COPILOT_CLI` alone does not skip |
-| CodeBuddy / WorkBuddy | Installed                 | Claude-format hooks in their own `settings.json`                    |
+| CodeBuddy / WorkBuddy | Installed                 | Claude-format hooks in their own `settings.json`; none on a WorkBuddy with only `.workbuddy-ai/` (see WorkBuddy below) |
 
 Practical rule: if you set up with `--agent claude`, expect **only** Claude to show
 hooks installed. A tool you are not using, or one that is not a supported hook
@@ -334,6 +334,10 @@ Walk them through opening the tool's config and adding the TeamAI session-start
 hook entry; if unsure of the exact config, run `teamai doctor` and `teamai hooks list`
 to see what should be present, then have them replicate it. Until then, they can
 sync with a manual `teamai pull`.
+
+Skip this on WorkBuddy 5.7+ with only `~/.workbuddy-ai/`. teamai does not know yet
+where 5.7 reads hooks, so it writes none, and `teamai doctor` names them under
+`workbuddy receives ...`. Do not hand-register a hook there; sync with `teamai pull`.
 
 ### Muse Code
 
@@ -453,3 +457,11 @@ Doctor checks the serialized rules reply against the user config `hooks.maxOutpu
 ## Pi user instructions with an override file
 
 Pi reads `AGENTS.override.md` before `AGENTS.md` in the same directory. In user scope, pull writes rules and instruction blocks into the existing override and strips only TeamAI blocks from the older configured file. Personal text in both files is preserved, including on uninstall. Without an override, the configured user file remains the target.
+
+## A file blocks skill delivery
+
+When a file occupies a tool skills directory, doctor fails the directory check even if delivery skipped that tool. Move the file aside and run `teamai pull`. Uninstall keeps the blocking file and cleans the other managed resources.
+
+## Kiro default-agent synchronization
+
+Kiro CLI V3 uses the generated user hook `~/.kiro/hooks/teamai.json`, independently of custom agents. Missing or edited hooks appear in doctor; reinject after moving aside a same-named personal file. User uninstall removes the managed file, project uninstall keeps it, and personal hook files remain. Upgrade Kiro 2.x to V3 for this lifecycle integration.
