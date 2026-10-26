@@ -144,6 +144,21 @@ describe('recall promote publishes the artifact before the marker', () => {
     expect(cli(['recall', 'promote']).output).not.toContain('- ready');
   });
 
+  it('keeps the learning out after the team renames its merged entry on main', () => {
+    expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
+    const branch = remotePushBranches();
+    git(['update-ref', 'refs/heads/main', branch]);
+    git(['branch', '-D', branch]);
+    const work = path.join(sandbox, 'work');
+    const env = { ...process.env, ...GIT_ENV };
+    execFileSync('git', ['clone', '-q', remote, work], { env });
+    execFileSync('git', ['mv', 'docs/ready.md', 'docs/ready-flow.md'], { cwd: work, env });
+    execFileSync('git', ['commit', '-qm', 'rename'], { cwd: work, env });
+    execFileSync('git', ['push', '-q', 'origin', 'main'], { cwd: work, env });
+
+    expect(cli(['recall', 'promote']).output).not.toContain('- ready');
+  });
+
   it('offers the learning again once its review branch is deleted unmerged', () => {
     expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
     git(['branch', '-D', remotePushBranches()]);

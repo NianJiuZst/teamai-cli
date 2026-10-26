@@ -34,9 +34,10 @@ const MIN_AGE_DAYS = 14;
 /**
  * Find learnings eligible for promotion to formal knowledge. A learning marked
  * `promoted_to` stays out only while that target is in place in
- * `knowledgeCheckout`, the git checkout of the team's knowledge, so one whose
- * review was closed unmerged and its branch deleted is offered again. Without
- * a checkout, the marker alone keeps it out.
+ * `knowledgeCheckout`, the git checkout of the team's knowledge: the default
+ * branch or an open review branch touched it. One whose review was closed
+ * unmerged and its branch deleted is offered again. Without a checkout, the
+ * marker alone keeps it out.
  */
 export async function findPromotionCandidates(
   learningsDirs: readonly string[],
@@ -119,21 +120,20 @@ export async function fetchPromotionRefs(knowledgeCheckout: string): Promise<voi
 }
 
 /**
- * The targets, relative to `knowledgeCheckout`, that origin's default branch
- * has or a review branch adds, as of the last fetch. Every target when there
- * is no checkout or git cannot tell.
+ * The targets, relative to `knowledgeCheckout`, that a commit on origin's
+ * default branch or on a review branch ever touched, as of the last fetch: an
+ * entry the team later renamed or deleted still counts. Every target when
+ * there is no checkout or git cannot tell.
  */
 async function promotionTargetsInPlace(knowledgeCheckout: string | undefined, targets: readonly string[]): Promise<ReadonlySet<string>> {
   if (knowledgeCheckout === undefined || targets.length === 0) return new Set(targets);
   try {
-    const git = createGit(knowledgeCheckout);
     const base = `origin/${await getDefaultBranch(knowledgeCheckout)}`;
-    const onBase = await git.raw(['--literal-pathspecs', 'ls-tree', '-z', '--name-only', base, '--', ...targets]);
-    const onReview = await git.raw([
+    const touched = await createGit(knowledgeCheckout).raw([
       '--literal-pathspecs', 'log', '-z', '--relative', '--name-only', '--format=',
-      `--remotes=origin/${PUSH_BRANCH_PREFIX}*`, `^${base}`, '--', ...targets,
+      base, `--remotes=origin/${PUSH_BRANCH_PREFIX}*`, '--', ...targets,
     ]);
-    return new Set(`${onBase}\0${onReview}`.split('\0').filter(Boolean));
+    return new Set(touched.split('\0').filter(Boolean));
   } catch (e) {
     log.debug(`Could not read promotion targets in ${knowledgeCheckout}; treating marked learnings as promoted: ${e instanceof Error ? e.message : String(e)}`);
     return new Set(targets);
