@@ -881,7 +881,10 @@ Upgrading from the per-checkout layout:
   `recall maintenance` and `recall promote` stop with exit code 1 and write
   nothing when either the reports lock (they rank by its votes) or the
   learnings lock is taken; the error names the lock and says to run the command
-  again, or to check that the partition is writable.
+  again, or to check that the partition is writable. Their refresh fetches into
+  the team clone, so it also takes the sync lock: while a pull or push holds
+  it, `recall maintenance` stops the same way, and the `recall promote` listing
+  reads both checkouts as they are.
 
 A git-mode install keeps the same checkouts and queue at the same partition
 paths (beside `<partition>/team-repo`), so after a project switches mode the
