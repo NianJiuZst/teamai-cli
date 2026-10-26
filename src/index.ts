@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import { Command, Option } from 'commander';
 import { setVerbose, setSilent, log } from './utils/logger.js';
 import { applyNonInteractiveGitEnv } from './utils/git-env.js';
@@ -1657,12 +1658,18 @@ recallCmd
     const { log } = await import('./utils/logger.js');
 
     // An HTTP team repo has no git checkout: its directory may sit in the business repo.
-    const { usesBranchWorktree } = await import('./types.js');
+    const { usesBranchWorktree, getDataHome, SYNC_LOCK_FILENAME } = await import('./types.js');
     const knowledgeCheckout = usesBranchWorktree(localConfig) ? repoPath : undefined;
     if (knowledgeCheckout && !cmdOpts.dryRun) {
-      await fetchPromotionRefs(knowledgeCheckout).catch((e: unknown) => {
+      // A fetch beside a pull in the same clone pushes the pull into its reset fallback.
+      const { withFileLock } = await import('./update.js');
+      const lock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
+      try {
+        const fetched = await withFileLock(lock, { attempts: 1, delayMs: 0 }, () => fetchPromotionRefs(knowledgeCheckout));
+        if (!fetched.held) log.warn('Another teamai pull/push is in progress, so candidates follow the last fetch of the review branches.');
+      } catch (e) {
         log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${e instanceof Error ? e.message : String(e)}`);
-      });
+      }
     }
     const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, knowledgeCheckout);
 

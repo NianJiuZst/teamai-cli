@@ -168,4 +168,19 @@ describe('recall promote publishes the artifact before the marker', () => {
     expect(again.code, again.output).toBe(0);
     expect(git(['show', 'teamai-learnings:learnings/ready.md'])).toContain('promoted_to: rules/ready.md');
   });
+
+  it('lists from the last fetch while another sync holds the lock', () => {
+    expect(cli(['recall', 'promote', 'ready', '--category', 'docs']).code).toBe(0);
+    git(['branch', '-D', remotePushBranches()]);
+    fs.writeFileSync(
+      path.join(home, '.teamai', '.sync-lock'),
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'another-pull' }),
+    );
+
+    const listing = cli(['recall', 'promote']);
+
+    expect(listing.code, listing.output).toBe(0);
+    expect(listing.output).toContain('Another teamai pull/push is in progress');
+    expect(listing.output).not.toContain('- ready');
+  });
 });
